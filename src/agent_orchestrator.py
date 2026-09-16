@@ -29,6 +29,7 @@ import boto3
 import json
 import time
 import os
+from datetime import datetime, timezone
 import sys
 import uuid
 import random
@@ -507,15 +508,112 @@ def build_refund_agent() -> Agent:
     WorkflowState and applies the correct policy window per customer tier.
     """
 
-    # TODO: Create a BedrockModel
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+    )
 
-    # TODO: System prompt for the Refund Agent
+    system_prompt = """You are the RefundAgent for NovaMart customer support.
 
-    # TODO: Implement get_inventory_context
+You decide whether a return or refund is allowed. You do not look orders up
+yourself — the InventoryAgent has already done that and written its findings
+to the shared WorkflowState.
 
-    # TODO: Implement initiate_refund
+Your decision process, in order:
+1. ALWAYS call get_inventory_context first. Never decide without it.
+2. Read the customer's tier from that context and apply the matching
+   return window:
+       Standard customers -> 30 days from delivery
+       Premium customers  -> 60 days from delivery
+3. Call initiate_refund to record the decision.
 
-    # TODO: Instantiate and return the Agent
+If the inventory context is missing or has no order, say so and do not
+approve anything."""
+
+    RETURN_WINDOWS = {'Standard': 30, 'Premium': 60}
+
+    @tool
+    def get_inventory_context(session_id: str) -> dict:
+        """Read the InventoryAgent's findings for this session.
+
+        Args:
+            session_id: The session whose WorkflowState to read.
+
+        Returns:
+            The inventory_agent portion of WorkflowState as a dict, or a dict
+            with an 'error' key when the session or the findings are missing.
+        """
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {'error': f'No workflow state for session {session_id}'}
+        findings = state.get('inventory_agent')
+        if not findings:
+            return {'error': 'InventoryAgent has not run for this session yet'}
+        return dict(findings)
+
+    @tool
+    def initiate_refund(session_id: str, customer_id: str, order_id: str) -> dict:
+        """Decide return eligibility and, if eligible, mark the order returned.
+
+        Applies the tier-appropriate window: 30 days for Standard customers,
+        60 days for Premium, measured from the delivery date.
+
+        Args:
+            session_id:  The session, used to read the inventory findings.
+            customer_id: The customer requesting the return.
+            order_id:    The order being returned.
+
+        Returns:
+            A dict with 'eligible' (bool), 'tier', 'window_days',
+            'days_since_delivery' and 'reason'.
+        """
+        context = get_inventory_context(session_id)
+        if 'error' in context:
+            return {'eligible': False, 'reason': context['error'],
+                    'tier': None, 'window_days': None,
+                    'days_since_delivery': None}
+
+        tier = context.get('tier', 'Standard')
+        window = RETURN_WINDOWS.get(tier, RETURN_WINDOWS['Standard'])
+
+        delivered_at = context.get('delivered_at')
+        if not delivered_at:
+            return {'eligible': False, 'tier': tier, 'window_days': window,
+                    'days_since_delivery': None,
+                    'reason': 'Order has no delivery date on record'}
+
+        delivered = datetime.strptime(delivered_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - delivered).days
+        eligible = days <= window
+
+        if eligible:
+            dynamodb.Table(config.ORDERS_TABLE).update_item(
+                Key={'customer_id': customer_id, 'order_id': order_id},
+                UpdateExpression='SET #s = :s, refund_initiated_at = :t',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={
+                    ':s': 'RETURN_APPROVED',
+                    ':t': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                },
+            )
+
+        return {
+            'eligible': eligible,
+            'tier': tier,
+            'window_days': window,
+            'days_since_delivery': days,
+            'reason': (f'Within the {window}-day {tier} return window'
+                       if eligible else
+                       f'{days} days since delivery exceeds the {window}-day '
+                       f'{tier} return window'),
+        }
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_inventory_context, initiate_refund],
+        name="RefundAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
