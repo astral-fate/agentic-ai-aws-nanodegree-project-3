@@ -1181,14 +1181,27 @@ def deploy_to_agentcore_runtime(
     runtime_name = f"{config.PROJECT_NAME}-runtime".replace('-', '_')
     s3_client    = boto3.client('s3', region_name=config.AWS_REGION)
 
-    # Check if runtime already exists
+    # Does a runtime with this name already exist?
+    #
+    # The starter returned its ARN here and stopped. That makes `deploy` a
+    # no-op the moment a runtime exists: the code is packaged and uploaded to
+    # S3, and then nothing ever points the runtime at the new artifact. Live,
+    # this hid two fixes for several runs — the container kept serving the
+    # first deploy's broken entry point while the script reported success, and
+    # deleting the local state file did not help because the reuse is keyed on
+    # the runtime NAME in AWS, not on local state.
+    #
+    # An existing runtime is now UPDATED with the freshly uploaded artifact.
+    # The ARN is recorded first so it is still returned if the update fails.
+    existing_runtime_id = None
     try:
         existing = agentcore_control.list_agent_runtimes()
         for r in existing.get('agentRuntimes', []):
             if r['agentRuntimeName'] == runtime_name:
-                runtime_arn = r['agentRuntimeArn']
-                print(f"AgentCore Runtime already exists: {runtime_arn}")
-                return runtime_arn
+                existing_runtime_id = r.get('agentRuntimeId') or r['agentRuntimeArn'].rsplit('/', 1)[-1]
+                print(f"AgentCore Runtime exists ({existing_runtime_id}) — "
+                      f"updating it with the current code.")
+                break
     except Exception as e:
         print(f"  [Note] Could not check existing runtimes: {e}")
 
@@ -1242,8 +1255,10 @@ def deploy_to_agentcore_runtime(
     )
     print(f"  Artifact uploaded: s3://{config.POLICY_BUCKET}/{artifact_key}")
 
-    response = agentcore_control.create_agent_runtime(
-        agentRuntimeName=runtime_name,
+    # Same arguments either way; create and update differ only in the
+    # name-vs-id key, so the artifact and environment cannot drift between
+    # the two paths.
+    _runtime_args = dict(
         description='NovaMart multi-agent customer support orchestrator',
         roleArn=config.AGENTCORE_ROLE_ARN,
         # agentRuntimeArtifact is a tagged union - exactly one of
@@ -1279,9 +1294,62 @@ def deploy_to_agentcore_runtime(
             'WORKER_MODEL_ID':       WORKER_MODEL_ID,
         },
     )
+
+    if existing_runtime_id:
+        response = agentcore_control.update_agent_runtime(
+            agentRuntimeId=existing_runtime_id, **_runtime_args)
+        print(f"  Runtime updated with the current artifact ({artifact_key}).")
+    else:
+        response = agentcore_control.create_agent_runtime(
+            agentRuntimeName=runtime_name, **_runtime_args)
+        print(f"  Runtime created from {artifact_key}.")
+
     # Note: guardrailConfiguration is also injected automatically via the
     # event hook registered above.
-    return response.get('agentRuntimeArn', response.get('arn', ''))
+    runtime_arn = response.get('agentRuntimeArn', response.get('arn', ''))
+    runtime_id  = (response.get('agentRuntimeId')
+                   or existing_runtime_id
+                   or (runtime_arn.rsplit('/', 1)[-1] if runtime_arn else ''))
+
+    # Wait for READY before returning.
+    #
+    # create/update return as soon as AWS accepts the request; the container
+    # is still being built. Invoking in that window fails with
+    # "ValidationException: The requested agentic resource endpoint ...",
+    # which reads like a wrong ARN rather than a runtime that simply is not up
+    # yet — and the deploy script moves straight on to the scenario and
+    # adversarial phases, so every one of them failed for that reason.
+    #
+    # CREATE_FAILED / UPDATE_FAILED are reported with failureReason rather
+    # than waited out: that is the container failing to build, and no amount
+    # of polling fixes it.
+    if runtime_id:
+        print(f"  Waiting for runtime {runtime_id} to become READY...")
+        deadline = time.time() + 600
+        status = 'UNKNOWN'
+        while time.time() < deadline:
+            try:
+                info   = agentcore_control.get_agent_runtime(agentRuntimeId=runtime_id)
+                status = info.get('status', 'UNKNOWN')
+            except Exception as exc:
+                print(f"  [Note] Could not read runtime status: {exc}")
+                break
+
+            if status == 'READY':
+                print(f"  Runtime is READY.")
+                break
+            if status in ('CREATE_FAILED', 'UPDATE_FAILED'):
+                reason = info.get('failureReason', '(no failureReason given)')
+                print(f"  Runtime status {status}: {reason}")
+                print(f"  The runtime exists but will not serve traffic. "
+                      f"Invocations will fail until this is resolved.")
+                break
+            time.sleep(10)
+        else:
+            print(f"  Runtime still {status} after 10 minutes — "
+                  f"invocations may fail until it settles.")
+
+    return runtime_arn
 
 
 # ═══════════════════════════════════════════════════════

@@ -28,9 +28,9 @@ this module is careful never to blur them:
              real guardrail, real model) and records what actually came
              back. This is the only mode that can observe enforcement.
 
-This machine has no AWS credentials (see MEMORY.md), so --offline is the
-only mode that has actually been run here. --live only runs from CloudShell
-with real credentials, wired in by cloudshell/_deploy-e2e.template.sh.
+--live runs from AWS CloudShell against a real deployed runtime, wired in by
+cloudshell/_deploy-e2e.template.sh. --offline needs no AWS account at all and
+is what the committed evidence/offline/ run contains.
 """
 
 from __future__ import annotations
@@ -255,8 +255,8 @@ def run_live(runtime_arn: str) -> list[dict]:
             # cause was an API parameter shape, visible only by opening the
             # transcript afterwards. The terminal should not hide it.
             reason = " ".join(str(exc).split())
-            if len(reason) > 160:
-                reason = reason[:157] + "..."
+            if len(reason) > 400:
+                reason = reason[:397] + "..."
             print(f"           └─ {type(exc).__name__}: {reason}", flush=True)
         report.append(entry)
     return report
