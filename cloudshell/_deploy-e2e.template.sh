@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v07.sh              deploy everything, then grade it
-#     bash deploy-e2e-v07.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v07.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v07.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v07.sh --teardown   delete everything it created
+#     bash deploy-e2e-v08.sh              deploy everything, then grade it
+#     bash deploy-e2e-v08.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v08.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v08.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v08.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v07.sh --teardown
+#     bash deploy-e2e-v08.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v07.sh
+    bash cloudshell/deploy-e2e-v08.sh
 
 REFUSE
   exit 2
@@ -89,7 +89,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v07"
+SCRIPT_VERSION="v08"
 
 REGION="${AWS_REGION:-us-east-1}"
 
