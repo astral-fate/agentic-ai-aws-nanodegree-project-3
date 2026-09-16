@@ -2106,8 +2106,15 @@ if __name__ == '__main__':
             print(f"Session: {session_id} | Customer: {customer_id}")
             print(f"Query: {query}")
             prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
-            response = orchestrator(prompt)
+            # Same tracer.trace_request(...) construct as _serve_http's
+            # do_POST - one pattern for opening the X-Ray root, not three.
+            # Without this, this exact command (which the project brief
+            # names as how to generate the traces behind the Service Map
+            # screenshot) would publish nothing.
+            with tracer.trace_request(session_id, customer_id, query):
+                response = orchestrator(prompt)
             print(f"Response: {response}")
+            print(f"X-Ray trace id: {tracer.last_trace_id or '(tracing disabled or not sampled)'}")
 
     elif len(sys.argv) > 1 and sys.argv[1] == 'chat':
         # ── Interactive terminal chat - educational mode ───────────────────
@@ -2188,10 +2195,14 @@ if __name__ == '__main__':
             t0_turn = time.time()
 
             # ── Install proxy, run orchestrator, restore stdout ────────────
+            # Same tracer.trace_request(...) construct as _serve_http's
+            # do_POST and 'test' mode above - one pattern for opening the
+            # X-Ray root, not three.
             trace.new_turn()
             sys.stdout = _trace_writer
             try:
-                response = orchestrator(prompt)
+                with tracer.trace_request(session_id, customer_id, user_input):
+                    response = orchestrator(prompt)
             finally:
                 sys.stdout = _real_stdout   # always restore, even on exception
 
@@ -2204,6 +2215,8 @@ if __name__ == '__main__':
 
             # ── DynamoDB workflow state summary ───────────────────────────
             trace.summary(session_id, elapsed)
+            print(f"  {_C.GRY}X-Ray trace id: "
+                  f"{tracer.last_trace_id or '(tracing disabled or not sampled)'}{_C.RESET}")
 
             # ── Final customer-facing response ────────────────────────────
             print()
