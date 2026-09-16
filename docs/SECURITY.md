@@ -46,7 +46,7 @@ fabricated response — it enforces nothing. This is configuration coverage,
 not enforcement evidence. Only `scripts/run_adversarial.py --live`, run
 against a real deployed guardrail, can show whether a prompt was actually
 blocked, anonymized, or passed through. That has not happened on this
-machine (see `docs/TESTING.md` and `MEMORY.md`).
+machine — see `docs/TESTING.md`.
 
 ## PII handling split
 

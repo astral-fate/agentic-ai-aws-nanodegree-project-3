@@ -10,8 +10,10 @@ unless stated otherwise.
 DynamoDB, and a scripted, rule-based model stand-in — not a live LLM. What
 that does and does not establish is set out precisely in
 [`docs/TESTING.md`](docs/TESTING.md), and summarised at the bottom of this
-page. The two required screenshots are **pending the live run** — see
-`MEMORY.md` and `docs/RUNBOOK.md` for why it has not happened yet.
+page. The two required screenshots are **pending the live run** — no AWS
+credentials are available on this machine and the Udacity Cloud Lab had
+not been launched at the time of this commit; see `docs/RUNBOOK.md` for
+the procedure that produces them once it is.
 
 `tests/test_agent.py all` totals **120/120 points** when run against a real
 deployed stack (40 + 20 + 15 + 25 + 20, across Tasks 2-6 below); that total
@@ -129,6 +131,7 @@ the concrete precedent: **project 2's live run scored five of seven
 scenarios, and both failures were the model skipping a tool call** — a
 failure mode a green offline run cannot surface. Tasks 5's three
 Knowledge Base checks and the two required screenshots depend entirely on
-a live deployment that has not happened on this machine (see `MEMORY.md`);
-`docs/RUNBOOK.md` is the procedure that closes that gap once the Udacity
-Cloud Lab is launched.
+a live deployment that has not happened on this machine — no AWS
+credentials are available here and the Udacity Cloud Lab had not been
+launched at the time of this commit; `docs/RUNBOOK.md` is the procedure
+that closes that gap once it is.

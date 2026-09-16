@@ -8,8 +8,8 @@ transcripts, and (once a live run exists) AWS console screenshots.
 under `evidence/live/`.** As of this commit, `evidence/live/` does not exist:
 no AWS credentials were available on the machine that wrote this project,
 and the Udacity Cloud Lab had not been launched (see
-`.superpowers/sdd/2026-09-16-novamart-multi-agent-support/`'s task notes and
-the top-level `MEMORY.md`). Everything currently committed under
+`docs/TESTING.md` for what that does and does not mean for the claims made
+about this project). Everything currently committed under
 `evidence/offline/` was produced by the offline harness
 (`harness/bootstrap.py` + moto + a scripted, non-LLM model stand-in) — real
 runs of real, unmodified project code, but against stubbed AWS and a

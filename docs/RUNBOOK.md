@@ -3,13 +3,15 @@
 Two paths. **Offline** (this machine, any machine): proves the wiring, no
 AWS account needed, runs in seconds. **Live** (AWS CloudShell): the actual
 graded run, costs money while resources are up, and has not been executed
-yet from this repository (see `MEMORY.md`).
+yet from this repository — no AWS credentials are available on this
+machine and the Udacity Cloud Lab had not been launched at the time of
+this commit.
 
 ## Offline: test the wiring
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest tests_offline/ -v              # 61 passed, ~11s
+python -m pytest tests_offline/ -v              # 61 passed in 18.07s
 python scripts/run_scenarios.py --offline       # 3 scenario transcripts
 python scripts/run_adversarial.py --offline     # 6 guardrail-config transcripts
 ```

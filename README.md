@@ -7,7 +7,7 @@ Bedrock AgentCore.
 **Status: everything is built and offline-tested (61/61 passing). Nothing
 has been run against a live AWS account yet** — no credentials are
 available on this machine and the Udacity Cloud Lab had not been launched
-at the time of this commit. See `MEMORY.md` and
+at the time of this commit. See
 [`docs/TESTING.md`](docs/TESTING.md) for exactly what that does and does
 not mean for the claims below.
 
@@ -42,7 +42,7 @@ tool calls: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest tests_offline/ -v      # 61 passed, ~11 seconds
+python -m pytest tests_offline/ -v      # 61 passed in 18.07s (evidence/run-01/pytest_output.txt)
 ```
 
 This imports the real, unmodified `src/agent_orchestrator.py` through

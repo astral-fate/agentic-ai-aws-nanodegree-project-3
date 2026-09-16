@@ -1,6 +1,7 @@
 # What the tests prove, and what they do not
 
-The offline suite runs in about 11 seconds with no AWS account, no
+The offline suite runs in under 20 seconds (`evidence/run-01/pytest_output.txt`
+records 18.07s) with no AWS account, no
 credentials and no network:
 
 ```
@@ -140,9 +141,11 @@ API shape drift, service quotas and region availability are all unverified.
 
 ### The precedent: project 2's live run
 
-This is not a hypothetical concern. [Project 2's live
-run](../../agentic-ai-aws-nanodegree-project-2/evidence/run-02/INDEX.md)
-against a real deployed agent scored **five of seven scenarios**, and
+This is not a hypothetical concern. Project 2 (a separate nanodegree
+submission, not shipped inside this repository, so no link here would
+resolve for a reader of this repo alone) ran its live evidence at
+`evidence/run-02/INDEX.md` in that project's own repo. It deployed the
+agent and scored **five of seven scenarios**, and
 **both failures were the model skipping a tool call and answering from its
 own weights** — invented an order status instead of calling `get_order`;
 approved a refund for a fabricated amount because it called
@@ -159,8 +162,8 @@ in one paste (`cloudshell/README.md`), runs `tests/test_agent.py all`
 against it, and runs both `scripts/run_adversarial.py --live` and
 `scripts/run_scenarios.py --live` against the deployed runtime. That live
 run is what closes every gap in this document — it has not happened yet
-(no AWS credentials on this machine, Cloud Lab not launched; see
-`MEMORY.md`), and `evidence/live/` does not exist until it does.
+(no AWS credentials on this machine, Cloud Lab not launched), and
+`evidence/live/` does not exist until it does.
 
 The offline suite is not a substitute for that run. It is what makes that
 run worth doing: by the time it happens, every wiring bug is already fixed,
