@@ -7,26 +7,70 @@ first, so an interrupted cleanup still stops the meter.
     python infrastructure/cleanup.py          # list what would be deleted
     python infrastructure/cleanup.py --yes    # delete it
 
-No-credentials behavior: config.py reads CloudFormation exports and calls
-sts.get_caller_identity() at import time, so `import config` itself raises
-when this machine has no AWS credentials (or the stack was never deployed).
-Rather than let that exception crash the script, we catch it once here and
-degrade to "nothing to discover" - the dry-run banner and the --yes hint
-still print, and the script still exits 0, so a student who has not
-deployed anything yet gets a clear message instead of a traceback.
+No-credentials behavior: config.py calls sts.get_caller_identity() and reads
+CloudFormation exports at import time, so `import config` itself raises
+when this machine has no AWS credentials or cannot reach AWS. We catch only
+that specific class of failure here and degrade to "nothing to discover" -
+the dry-run banner and the --yes hint still print, and the script still
+exits 0.
+
+Deliberately NOT caught the same way: anything else `import config` might
+raise (a malformed CloudFormation export, a bad region, a real bug in
+config.py). This script exists so a student can stop paying for idle
+Knowledge Bases and S3 Vectors indexes; a cleanup tool that reports
+"nothing to discover" when it merely failed to look invites the exact wrong
+conclusion - that spend has stopped when it has not. So a non-credential
+failure propagates as an ordinary uncaught exception (traceback, non-zero
+exit) rather than being folded into the "nothing found" success path.
 """
-import os
 import sys
 import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import boto3
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    NoCredentialsError,
+    PartialCredentialsError,
+)
+
+# ClientError codes that mean "we cannot authenticate/authorize", as opposed
+# to some other AWS-side failure (missing export, bad request, etc.) that
+# should propagate instead of being read as "nothing to discover".
+_AUTH_ERROR_CODES = {
+    "AccessDenied",
+    "AccessDeniedException",
+    "AuthFailure",
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidAccessKeyId",
+    "InvalidClientTokenId",
+    "SignatureDoesNotMatch",
+    "UnrecognizedClientException",
+}
+
+
+def _is_credential_or_connectivity_error(exc: Exception) -> bool:
+    """True only for "we could not reach/authenticate to AWS" failures.
+
+    Everything else (a missing CloudFormation export, a KeyError, any other
+    bug) must not be mistaken for "there is nothing to clean up".
+    """
+    if isinstance(exc, (NoCredentialsError, PartialCredentialsError, EndpointConnectionError)):
+        return True
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "") in _AUTH_ERROR_CODES
+    return False
+
 
 try:
     import config
     _CONFIG_ERROR = None
-except Exception as exc:  # no credentials, no stack, no network reachability
+except Exception as exc:
+    if not _is_credential_or_connectivity_error(exc):
+        raise
     config = None
     _CONFIG_ERROR = exc
 
@@ -57,7 +101,7 @@ def plan() -> list[dict]:
     steps = []
     for kind, why in _ORDER:
         for name in _discover(kind):
-            if _owned(name) or kind == "cloudformation-stack":
+            if _owned(name):
                 steps.append({"kind": kind, "name": name, "why": why})
     return steps
 
@@ -113,8 +157,7 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
 
     if config is None:
-        print(f"No AWS credentials (or no deployed {os.environ.get('PROJECT_NAME', 'project')} "
-              f"stack) found; nothing to discover.")
+        print("No AWS credentials or connectivity; nothing to discover.")
         print(f"  ({_CONFIG_ERROR})")
         steps = []
     else:
