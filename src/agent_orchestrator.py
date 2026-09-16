@@ -47,13 +47,21 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Strands Agents SDK - see: https://github.com/strands-agents/sdk-python
-from strands import Agent, tool
+#
+# `tool` comes from agent_observability, not straight from strands: it is a
+# drop-in replacement (see agent_observability.tool's docstring) that wraps
+# the real strands.tool and additionally opens an X-Ray subsegment per call.
+# Importing the plain strands.tool here would build a graph of five agents
+# that never emits a single subsegment - every @tool below would run, but
+# the X-Ray Service Map the Udacity rubric asks for would have nothing to
+# draw, because no route_to_*/search_*/check_* call would ever be traced.
+from strands import Agent
 from strands.models import BedrockModel
 from boto3.dynamodb.conditions import Key
 
 import config
 from bedrock_kb_retrieval import retrieve_from_knowledge_base, format_kb_results
-from agent_observability import apply_observability_config
+from agent_observability import apply_observability_config, tool, tracer, trace_kb_retrieval
 
 # Configure logging for debugging
 logging.basicConfig(
@@ -664,7 +672,17 @@ def build_policy_agent() -> Agent:
                 source (see format_kb_results), or a message stating that no
                 relevant documents were found.
             """
-            return format_kb_results(retrieve_from_knowledge_base(kb_id, query, top_k=3))
+            # agent_observability.trace_kb_retrieval opens a 'remote'-namespace
+            # subsegment named KnowledgeBase:<domain> - only a 'remote'
+            # namespace segment renders as its own node on the X-Ray Service
+            # Map (a plain nested subsegment shows in the trace waterfall but
+            # not as a graph node). Without this, the retriever's own
+            # search_policy subsegment would still exist, but the rubric's
+            # "KnowledgeBase agents" nodes would not - this call site is the
+            # only place this project's own code (not the untouched
+            # bedrock_kb_retrieval.py starter file) can open it.
+            with trace_kb_retrieval(kb_id):
+                return format_kb_results(retrieve_from_knowledge_base(kb_id, query, top_k=3))
 
         search_policy.__name__ = f'search_{domain}_policy'
 
@@ -1681,7 +1699,18 @@ def _serve_http() -> None:
 
                 enriched_prompt = (f"[Session ID: {session_id}] "
                                     f"[Customer ID: {customer_id}] {prompt}")
-                response = orchestrator(enriched_prompt)
+                # Opens the X-Ray root segment for this request so the
+                # @tool subsegments each route_to_*/search_*/check_* call
+                # opens (agent_observability._traced, via the `tool` import
+                # above) have a parent to attach to and a trace id to
+                # publish under. Without this, AgentTracer.subsegment()
+                # finds no open root (_resolve_parent() returns None) and
+                # silently no-ops on every call - proven empirically while
+                # fixing this: a full scenario run through the real
+                # orchestrator left tracer.last_published False and
+                # tracer.last_trace_id None until this was added.
+                with tracer.trace_request(session_id, customer_id, prompt):
+                    response = orchestrator(enriched_prompt)
                 self._reply(200, {"response": str(response)})
             except Exception as exc:
                 self._reply(500, {"error": str(exc)})

@@ -404,13 +404,21 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Strands Agents SDK - see: https://github.com/strands-agents/sdk-python
-from strands import Agent, tool
+#
+# `tool` comes from agent_observability, not straight from strands: it is a
+# drop-in replacement (see agent_observability.tool's docstring) that wraps
+# the real strands.tool and additionally opens an X-Ray subsegment per call.
+# Importing the plain strands.tool here would build a graph of five agents
+# that never emits a single subsegment - every @tool below would run, but
+# the X-Ray Service Map the Udacity rubric asks for would have nothing to
+# draw, because no route_to_*/search_*/check_* call would ever be traced.
+from strands import Agent
 from strands.models import BedrockModel
 from boto3.dynamodb.conditions import Key
 
 import config
 from bedrock_kb_retrieval import retrieve_from_knowledge_base, format_kb_results
-from agent_observability import apply_observability_config
+from agent_observability import apply_observability_config, tool, tracer, trace_kb_retrieval
 
 # Configure logging for debugging
 logging.basicConfig(
@@ -1021,7 +1029,17 @@ def build_policy_agent() -> Agent:
                 source (see format_kb_results), or a message stating that no
                 relevant documents were found.
             """
-            return format_kb_results(retrieve_from_knowledge_base(kb_id, query, top_k=3))
+            # agent_observability.trace_kb_retrieval opens a 'remote'-namespace
+            # subsegment named KnowledgeBase:<domain> - only a 'remote'
+            # namespace segment renders as its own node on the X-Ray Service
+            # Map (a plain nested subsegment shows in the trace waterfall but
+            # not as a graph node). Without this, the retriever's own
+            # search_policy subsegment would still exist, but the rubric's
+            # "KnowledgeBase agents" nodes would not - this call site is the
+            # only place this project's own code (not the untouched
+            # bedrock_kb_retrieval.py starter file) can open it.
+            with trace_kb_retrieval(kb_id):
+                return format_kb_results(retrieve_from_knowledge_base(kb_id, query, top_k=3))
 
         search_policy.__name__ = f'search_{domain}_policy'
 
@@ -2038,7 +2056,18 @@ def _serve_http() -> None:
 
                 enriched_prompt = (f"[Session ID: {session_id}] "
                                     f"[Customer ID: {customer_id}] {prompt}")
-                response = orchestrator(enriched_prompt)
+                # Opens the X-Ray root segment for this request so the
+                # @tool subsegments each route_to_*/search_*/check_* call
+                # opens (agent_observability._traced, via the `tool` import
+                # above) have a parent to attach to and a trace id to
+                # publish under. Without this, AgentTracer.subsegment()
+                # finds no open root (_resolve_parent() returns None) and
+                # silently no-ops on every call - proven empirically while
+                # fixing this: a full scenario run through the real
+                # orchestrator left tracer.last_published False and
+                # tracer.last_trace_id None until this was added.
+                with tracer.trace_request(session_id, customer_id, prompt):
+                    response = orchestrator(enriched_prompt)
                 self._reply(200, {"response": str(response)})
             except Exception as exc:
                 self._reply(500, {"error": str(exc)})
@@ -5453,17 +5482,25 @@ returns the assembled response text - no trace id travels back over that
 API call, and the actual segment is written *inside* the running
 AgentCore Runtime container, which this process cannot read directly.
 
-So the trace id is looked up the only honest way available from outside the
-container: AWS X-Ray's GetTraceSummaries, restricted to the time window this
-scenario's call actually ran in, polled with the same ingestion-delay
-patience as capture_console.py's Service Map shot (traces take 30-60s to
-appear). This is a **time-window** lookup, not a targeted one: the code that
-builds the real X-Ray segments observed live (AgentCore Runtime's own
-auto-instrumentation via CloudWatch Transaction Search, configured by
-agent_orchestrator.configure_observability()) was never exercised against
-real AWS from this machine, so the exact segment/service name it uses in
-practice is unverified. If GetTraceSummaries returns more than one trace in
-a scenario's window, all of them are reported - never silently narrowed to a
+So the trace id is looked up from outside the container with AWS X-Ray's
+GetTraceSummaries, polled with the same ingestion-delay patience as
+capture_console.py's Service Map shot (traces take 30-60s to appear).
+
+Fix round 1/5 (see task-14-report.md) wired
+`agent_observability.tracer.trace_request(session_id, customer_id, prompt)`
+around the request handler in `_serve_http`'s `do_POST`
+(src/agent_orchestrator.py), which sets `annotations = {"session_id": ...}`
+on the root segment it publishes - X-Ray indexes segment annotations, so
+this now tries a **targeted** lookup first:
+`FilterExpression='annotation.session_id = "<id>"'`. This assumes the
+deployed runtime actually threads the same session_id from
+`invoke_agent_runtime` through to that handler, which was not (and could
+not be) verified live from this machine. If the targeted query finds
+nothing, this falls back to a **time-window** match over the scenario's
+call time - weaker (it can't tell this scenario's trace from an unrelated
+concurrent request), but real rather than fabricated. The transcript
+records which strategy actually matched. If GetTraceSummaries returns more
+than one trace, all of them are reported - never silently narrowed to a
 guess - so a human can correlate by timestamp against the transcript.
 """
 
@@ -5580,8 +5617,24 @@ def run_offline() -> list[dict]:
 # ─────────────────────────────────────────────────────────────
 
 def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
-                            wait: int, poll_interval: int = 10) -> tuple[list[str], str]:
-    """Poll AWS X-Ray for traces whose events fall in [start_ts, end_ts].
+                            wait: int, poll_interval: int = 10,
+                            session_id: str | None = None) -> tuple[list[str], str]:
+    """Poll AWS X-Ray for the trace(s) this scenario's call produced.
+
+    Tries a **targeted** lookup first: `_serve_http`'s `do_POST` (in
+    src/agent_orchestrator.py, fixed alongside this script - see
+    "Fix round 1/5" in task-14-report.md) now wraps every request in
+    `agent_observability.tracer.trace_request(session_id, customer_id,
+    prompt)`, which sets `annotations = {"session_id": ..., ...}` on the
+    published root segment - X-Ray indexes segment annotations and
+    `GetTraceSummaries` can filter on them directly
+    (`annotation.session_id = "<id>"`), which is far more precise than a
+    time window. This assumes the deployed runtime actually threads the
+    same session_id from `invoke_agent_runtime` through to that handler,
+    which was not (and could not be) verified live from this machine - so
+    if the targeted query finds nothing, this falls back to the
+    time-window match rather than reporting a hard failure, and the
+    returned note says plainly which strategy actually matched.
 
     Returns (trace_ids, note). Never raises - a missing/misconfigured X-Ray
     client is reported in `note`, not fabricated as an empty-but-successful
@@ -5597,20 +5650,36 @@ def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
     except Exception as exc:  # noqa: BLE001
         return [], f"could not create an X-Ray client: {exc}"
 
+    start = dt.datetime.utcfromtimestamp(start_ts - 5)
     deadline = time.time() + wait
     last_note = ""
     while True:
+        end = dt.datetime.utcfromtimestamp(max(end_ts, time.time()) + 1)
+
+        if session_id:
+            try:
+                resp = xray.get_trace_summaries(
+                    StartTime=start, EndTime=end, TimeRangeType="Event",
+                    FilterExpression=f'annotation.session_id = "{session_id}"',
+                )
+                ids = [s["Id"] for s in resp.get("TraceSummaries", []) if "Id" in s]
+                if ids:
+                    return ids, ("GetTraceSummaries, targeted match on "
+                                 f"annotation.session_id={session_id!r}")
+            except Exception as exc:  # noqa: BLE001
+                last_note = f"annotation-filtered GetTraceSummaries failed: {exc}"
+
         try:
             resp = xray.get_trace_summaries(
-                StartTime=dt.datetime.utcfromtimestamp(start_ts - 5),
-                EndTime=dt.datetime.utcfromtimestamp(max(end_ts, time.time()) + 1),
-                TimeRangeType="Event",
+                StartTime=start, EndTime=end, TimeRangeType="Event",
             )
-            summaries = resp.get("TraceSummaries", [])
-            ids = [s["Id"] for s in summaries if "Id" in s]
+            ids = [s["Id"] for s in resp.get("TraceSummaries", []) if "Id" in s]
             if ids:
-                return ids, "GetTraceSummaries, time-window match (see module docstring)"
-            last_note = "no traces found in this window yet"
+                return ids, ("GetTraceSummaries, time-window match "
+                             "(annotation filter found nothing - see module docstring)"
+                             if session_id else
+                             "GetTraceSummaries, time-window match (see module docstring)")
+            last_note = last_note or "no traces found in this window yet"
         except Exception as exc:  # noqa: BLE001
             last_note = f"GetTraceSummaries failed: {exc}"
             break  # a real error (e.g. no credentials) won't fix itself by polling
@@ -5630,7 +5699,6 @@ def run_live(xray_wait: int, xray_poll_interval: int) -> list[dict]:
 
     region = config.AWS_REGION
     report = []
-    call_windows = []
 
     for scenario in SCENARIOS:
         session_id = f"s-live-{uuid.uuid4().hex[:8]}"
@@ -5660,7 +5728,8 @@ def run_live(xray_wait: int, xray_poll_interval: int) -> list[dict]:
     print(f"\nWaiting up to {xray_wait}s per scenario for X-Ray to ingest the traces...")
     for entry in report:
         ids, note = _lookup_xray_trace_ids(
-            entry["_start_ts"], entry["_end_ts"], region, xray_wait, xray_poll_interval
+            entry["_start_ts"], entry["_end_ts"], region, xray_wait, xray_poll_interval,
+            session_id=entry["session_id"],
         )
         entry["trace_ids"] = ids
         entry["trace_note"] = note
