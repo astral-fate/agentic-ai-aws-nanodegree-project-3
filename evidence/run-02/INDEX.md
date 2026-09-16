@@ -17,6 +17,7 @@ counterpart to [`../run-01`](../run-01/INDEX.md), which is the offline run.
 | [`03-scenario-run-with-trace-ids.png`](screenshots/03-scenario-run-with-trace-ids.png) | The three brief scenarios running live, each printing its X-Ray trace id | supporting |
 | [`03-knowledge-bases.png`](screenshots/03-knowledge-bases.png) | The three Bedrock Knowledge Bases in the console | supporting |
 | [`05-guardrail.png`](screenshots/05-guardrail.png) | `udacity-agentcore-guardrail`, status Ready | supporting |
+| [`07-kb-returns-detail.png`](screenshots/07-kb-returns-detail.png) · [`shipping`](screenshots/07-kb-shipping-detail.png) · [`warranty`](screenshots/07-kb-warranty-detail.png) | Per-KB detail: Titan Text Embeddings v2, 1024 dims, Vector store type **Amazon S3 Vectors** | **partial — see below** |
 
 Two further captures — the AgentCore runtime page and the CloudWatch log group —
 were attempted by `scripts/capture_console.py` and **rejected by its blank-render
@@ -25,6 +26,31 @@ list, the other rendered 571 characters. They are not in this directory, because
 screenshot of the wrong page is worse than no screenshot. The detector also
 declined to overwrite the Service Map capture above with a blank, which is the
 reason that file survived an automated re-run.
+
+### Known limits of the per-KB captures
+
+The `07-kb-*-detail.png` captures are **incomplete evidence** and are labelled
+as such rather than presented as sufficient:
+
+- A docked CloudShell panel overlaps the upper half of each page, hiding the KB
+  header and the Data source section.
+- The console renders **`S3 vector index: —`** rather than naming
+  `returns-policy-index` and its siblings, so the index binding is not visible
+  even in the unobstructed part.
+
+What they do show correctly: the KB name, **Titan Text Embeddings v2** at 1024
+dimensions, and **Vector store type: Amazon S3 Vectors**.
+
+The list view is no better — it reports `Last sync date: -` and `Last sync: 0`
+for all three KBs even though the deploy log recorded
+`syncing returns … COMPLETE (15s)` and the live run retrieved real passages from
+each one. A reviewer reading that column would reasonably conclude they were
+never synced.
+
+The authoritative evidence for both the index binding and the sync state is the
+API, not the console: `bedrock-agent get-knowledge-base` returns the
+`storageConfiguration` naming each index, and `list-ingestion-jobs` returns the
+`COMPLETE` status per data source.
 
 ## Graded result
 
