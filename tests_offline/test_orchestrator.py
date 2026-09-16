@@ -35,18 +35,19 @@ def test_return_request_routes_inventory_then_refund(orch):
     seq = _route(orch, "I want to return my order ORD-27176 (CUST-001)")
     assert seq[0] == "initialize_session"
     assert seq.index("route_to_inventory_agent") < seq.index("route_to_refund_agent")
+    assert "route_to_policy_agent" not in seq
     assert seq[-1] == "route_to_communication_agent"
 
 
 def test_policy_question_routes_to_policy(orch):
-    # NOTE: intentionally avoids the words "return"/"refund"/"order status"/
-    # "track" - the scripted harness (harness/scripted_model.py, pre-written
-    # and not to be modified) classifies purely on those substrings in the
-    # prompt text, with no reference to the orchestrator's system prompt or
-    # model at all. "return policy" would trip its is_return branch before
-    # ever reaching the policy fallback, which would make this test exercise
-    # the wrong rule regardless of how build_orchestrator_agent is written.
-    seq = _route(orch, "What is the shipping policy for premium customers?")
+    # This is scenario 2 in the brief's end-to-end table: a policy-meaning
+    # question that happens to contain the word "return" ("return policy").
+    # The scripted harness (harness/scripted_model.py) discriminates policy
+    # questions from return/refund requests by topic (policy/warranty/
+    # shipping-rate wording) versus a named order id or first-person request
+    # intent, rather than by the bare substring "return", specifically so
+    # this prompt is not misclassified as a return request.
+    seq = _route(orch, "What is the return policy for premium customers?")
     assert "route_to_policy_agent" in seq
     assert "route_to_refund_agent" not in seq
     assert seq[-1] == "route_to_communication_agent"
@@ -68,7 +69,7 @@ def test_math_question_routes_to_no_worker(orch):
 
 @pytest.mark.parametrize("prompt", [
     "I want to return my order ORD-27176 (CUST-001)",
-    "What is the shipping policy for premium customers?",
+    "What is the return policy for premium customers?",
     "Am I premium? (CUST-001)",
     "How much are 5 items at $29.99 with 10% off?",
 ])

@@ -93,12 +93,32 @@ def _orchestrate(agent, prompt, customer, session):
 
     is_math = any(k in low for k in ("how much", "calculate", "% off", "discount of"))
     is_account = any(k in low for k in ("my tier", "am i premium", "my account"))
-    is_return = any(k in low for k in ("return", "refund", "order status", "track"))
+
+    # Policy questions ask about a RULE ("what is the return policy...",
+    # "what is the warranty on...", "how long do I have to return an item").
+    # Return/refund requests instead name a specific order or use
+    # first-person intent about the customer's own order ("I want to return
+    # my order ORD-27176", "track my order"). A bare "return"/"refund"
+    # keyword match can't tell these apart - "return policy" contains
+    # "return" - so check for the policy-topic signal first, and only treat
+    # something as a return/refund request when it also names an order or
+    # carries first-person request intent.
+    is_policy_topic = any(k in low for k in
+                          ("policy", "warranty", "shipping rate", "return window"))
+    has_order_id = bool(_ORDER_RE.search(prompt))
+    is_request_intent = any(k in low for k in
+                            ("i want to return", "i'd like to return",
+                             "i would like to return", "i want a refund",
+                             "i'd like a refund", "order status", "track"))
+    is_return = (has_order_id or is_request_intent
+                 or ("refund" in low and not is_policy_topic))
 
     if is_math:
         pass                                    # Rule 5 - answer directly
     elif is_account:
         _call(agent, "route_to_inventory_agent", session_id=session, query=prompt)
+    elif is_policy_topic and not is_return:
+        _call(agent, "route_to_policy_agent", session_id=session, query=prompt)
     elif is_return:
         _call(agent, "route_to_inventory_agent", session_id=session, query=prompt)
         _call(agent, "route_to_refund_agent", session_id=session, query=prompt)

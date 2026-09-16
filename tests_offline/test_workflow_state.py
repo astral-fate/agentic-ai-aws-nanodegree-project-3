@@ -1,26 +1,41 @@
 import threading
 
 
-def test_concurrent_writers_both_land(orchestrator):
-    """_update_workflow_state retries on a version clash, so neither write is lost.
+def test_stale_version_writer_retries_and_neither_write_is_lost(orchestrator):
+    """A writer holding a stale `expected_version` retries and still lands.
 
-    The call into DynamoDB itself is serialized with a lock below. moto's
-    in-memory backend does not reliably make a conditional update_item
-    atomic across real OS threads: two threads can both pass the
-    ConditionExpression check for the same starting version before either
-    applies its write, so neither ever sees a ConditionalCheckFailedException
-    and the loser's write is silently folded in without the retry path
-    running - confirmed independently with a 200-iteration diagnostic run
-    that reproduced a stuck-at-version-1 result with both columns written
-    and zero raised errors, roughly 5% of the time. That is a limitation of
-    moto's mock, not of the pre-written `_update_workflow_state`, which is
-    written the way real (atomic) DynamoDB conditional writes require. The
-    lock forces the two update_item calls to be applied one at a time so the
-    second one genuinely collides and moto raises the conflict for real,
-    which is what actually exercises `_update_workflow_state`'s retry loop.
-    The two threads still race up to that point via the barrier, so which
-    writer becomes the winner and which becomes the retrying loser is still
-    nondeterministic.
+    Both threads read `start` as their expected_version, then race (via the
+    barrier below) to write. Whichever one applies first bumps the version;
+    the other's conditional check now legitimately fails against a stale
+    version, so `_update_workflow_state` catches the conflict, re-reads the
+    current version, and retries - landing its write instead of losing it.
+    That is the behavior under test: `_update_workflow_state` retries on a
+    version clash rather than silently dropping the loser's update, and the
+    final version is start + 2 because both writes (the immediate winner and
+    the retried loser) each bump it once.
+
+    This test does NOT demonstrate that DynamoDB's conditional update is safe
+    under genuine, unserialized concurrent access - only that the retry path
+    recovers correctly once a conflict is detected. Recovery is all it can
+    show, for the following reason:
+
+    The `write_lock` below forces the two `_update_workflow_state` calls to
+    be applied one at a time (the threads still race up to that point via
+    `barrier`, so which one wins is nondeterministic). The lock is there
+    because moto's in-memory DynamoDB backend does not reliably make a
+    conditional `update_item` atomic across real OS threads: without it,
+    both threads can pass the ConditionExpression check for the same
+    starting version before either applies its write, so neither ever sees
+    a ConditionalCheckFailedException and the loser's write is silently
+    folded in alongside the winner's without the retry path ever running -
+    confirmed with a standalone 200-iteration diagnostic (outside pytest,
+    driving `_update_workflow_state` directly) that reproduced exactly this:
+    zero raised exceptions in either thread, both `inventory_agent` and
+    `policy_agent` columns present, but `version` stuck at `start + 1`
+    instead of `start + 2`, in 11 of 200 iterations (~5.5%). That is a
+    limitation of moto's mock, not of the pre-written
+    `_update_workflow_state`, which is written the way real (atomic)
+    DynamoDB conditional writes require and which is not modified here.
     """
     sid = "s-concurrent"
     orchestrator._create_workflow_state(sid, "CUST-010")
