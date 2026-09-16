@@ -709,44 +709,50 @@ def build_policy_agent() -> Agent:
         """Search all three policy Knowledge Bases at once and collect the results.
 
         Fans the query out to the Returns, Shipping and Warranty retriever
-        sub-agents simultaneously, so one slow Knowledge Base does not delay
-        the others. A single Knowledge Base failing does not lose the other
-        two - its error is recorded and the other results are still returned.
+        SUB-AGENTS simultaneously - each unit of work invokes its retriever
+        agent object directly (not retrieve_from_knowledge_base directly), so
+        the retriever's own single tool is what actually reaches the
+        Knowledge Base. This keeps the three retriever agents a real part of
+        the execution graph (and of the resulting X-Ray trace) rather than
+        being constructed and then bypassed. One slow Knowledge Base does not
+        delay the others, and a single Knowledge Base failing does not lose
+        the other two - its error is recorded and the other results are
+        still returned.
 
         Args:
             query: The customer's policy question.
 
         Returns:
-            A dict with 'results' (a domain -> passages mapping covering all
-            three domains) and 'errors' (a domain -> message mapping, empty
-            when every retrieval succeeded).
+            A dict with 'results' (a domain -> retriever-response mapping
+            covering all three domains) and 'errors' (a domain -> message
+            mapping, empty when every retrieval succeeded).
         """
         results: dict = {}
         errors: dict = {}
 
-        def _retrieve(domain: str, kb_id: str):
-            return domain, retrieve_from_knowledge_base(kb_id, query, top_k=3)
+        def _retrieve(domain: str, retriever_agent: Agent):
+            return domain, retriever_agent(query)
 
         trace.kb_start({_TRACE_LABELS[d]: kb_id for d, (_a, kb_id) in _RETRIEVERS.items()})
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
-                executor.submit(_retrieve, domain, kb_id): domain
-                for domain, (_agent, kb_id) in _RETRIEVERS.items()
+                executor.submit(_retrieve, domain, retriever_agent): domain
+                for domain, (retriever_agent, _kb_id) in _RETRIEVERS.items()
             }
             for future in as_completed(futures):
                 domain = futures[future]
                 try:
-                    _, passages = future.result()
-                    results[domain] = passages
+                    _, response = future.result()
+                    results[domain] = response
                 except Exception as exc:
                     # One KB failing must not lose the other two.
-                    results[domain] = []
+                    results[domain] = ''
                     errors[domain] = str(exc)
 
         trace.kb_done(len(_RETRIEVERS))
         for domain in _RETRIEVERS:
-            trace.kb_result(_TRACE_LABELS[domain], format_kb_results(results.get(domain, [])))
+            trace.kb_result(_TRACE_LABELS[domain], str(results.get(domain, '')))
 
         return {'results': results, 'errors': errors}
 
