@@ -6,7 +6,8 @@ Bedrock AgentCore Runtime**, grounded in **three Bedrock Knowledge Bases**
 over **S3 Vectors**, guarded by **Bedrock Guardrails**, and traced end to end
 with **CloudWatch + X-Ray**.
 
-**Graded result: 120/120 (100%) on a live AWS account.**
+**Graded result: 120/120 (100%) on a live AWS account**, with both required
+submission screenshots captured — the test score and the X-Ray Service Map.
 
 ---
 
@@ -136,7 +137,7 @@ the spec, so none of the reference students' solutions survive.
 
 ### Testing strategy
 
-61 offline tests run with **no AWS account**: real `moto` DynamoDB (so
+86 offline tests run with **no AWS account**: real `moto` DynamoDB (so
 optimistic locking is genuinely exercised), stubbed Bedrock/AgentCore, and a
 rule-based planner in place of model inference.
 
@@ -188,17 +189,41 @@ The offline test that should have caught it was asserting our own guessed
 payload against itself; it now validates against **botocore's real service
 model**, so this class of error fails offline.
 
-### Still outstanding
+### The X-Ray Service Map
 
-- **X-Ray Service Map screenshot** — not yet captured. Requires Bedrock model
-  access for Claude Haiku 4.5 / Sonnet 4.5 in `us-east-1`; the live
-  adversarial suite returned `verdict=error` on all six cases, consistent with
-  the runtime being unable to invoke the model.
-- **Adversarial live verdicts** — the suite runs and writes evidence, but
-  every case errored for the reason above. Offline configuration coverage is
-  committed under `evidence/offline/adversarial/`.
+![X-Ray Service Map](evidence/run-02/screenshots/02-xray-service-map.png)
 
----
+`Client → NovaMart…estrator` fanning out to **PolicyAgent**,
+**CommunicationAgent**, **KnowledgeBase:returns** and **KnowledgeBase:warranty**,
+every one a `Remote` node. Produced by `python src/agent_orchestrator.py test`,
+which is what the project brief specifies.
+
+The retriever sub-agents appear as their own nodes because they are invoked as
+agents rather than as plain in-tool function calls — that is the whole reason
+the PolicyAgent fans out to three sub-agents instead of making three function
+calls, and it is what makes this graph satisfy the observability rubric.
+
+The same run proved the routing rules live: the return request went
+inventory → refund → communication in order, the math question routed to no
+worker and answered correctly, the communication agent was last on every
+request, and the three Knowledge Bases answered **in parallel in 4.2s** with
+real passages.
+
+### Honest notes from the live run
+
+- These runs used `openai.gpt-oss-20b-1:0` / `openai.gpt-oss-120b-1:0` via the
+  `ORCHESTRATOR_MODEL_ID` / `WORKER_MODEL_ID` overrides. Invoking Claude on this
+  account returns *"Model use case details have not been submitted for this
+  account"* — an account-enablement gate, not a code defect. The grader accepts
+  either family.
+- The wiring is right; the model is not flawless. The InventoryAgent asked for a
+  customer id already present in the prompt, and the CommunicationAgent claimed
+  it had no policy details just after the PolicyAgent retrieved them. Recorded in
+  [`evidence/run-02/INDEX.md`](evidence/run-02/INDEX.md) rather than smoothed over.
+- **Not verified live:** `--teardown` (its ownership fix landed after these
+  runs), and the deployed runtime serving traffic — it reaches `READY` but each
+  invocation hits AgentCore's 30-second initialisation budget, which importing
+  `strands` plus six boto3 clients does not fit.
 
 ## 5. Repository layout
 
@@ -286,8 +311,14 @@ Resumable — re-running skips whatever already exists.
 
 ## 7. Honest status
 
-Everything above that is marked ✅ was observed on a live AWS account and is
-backed by a committed screenshot or a captured log. The X-Ray Service Map and
-the live adversarial verdicts are **not** yet obtained and are labelled as
-outstanding rather than implied. `docs/TESTING.md` states exactly which claims
-the offline suite supports and which it cannot.
+Everything marked ✅ was observed on a live AWS account and is backed by a
+committed screenshot or a captured log. Both required submission artifacts — the
+120/120 score and the X-Ray Service Map — are in
+[`evidence/run-02/`](evidence/run-02/INDEX.md).
+
+What is *not* claimed: that the agents behave well (the live run shows two
+places they do not), that the guardrail blocks anything (its live verdicts were
+never obtained), that `--teardown` works (unexercised), or that the deployed
+runtime serves traffic (it does not, within AgentCore's 30s init budget).
+`docs/TESTING.md` states exactly which claims the offline suite supports and
+which it cannot.
