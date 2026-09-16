@@ -60,7 +60,15 @@ $TargetPatterns = @(
     'CustomerSupport',     # project 2 CamelCase resources
     'order-tracker',       # project 2 lambda
     'refund-processor',    # project 2 lambda
-    'support-chatbot'      # project 1/2 guardrail, seen in the console
+    'support-chatbot',     # project 1/2 guardrail, seen in the console
+    # AgentCore names some resources with underscores rather than hyphens, so
+    # the hyphenated patterns above miss them. A live inventory found four this
+    # way -- customer_support_agent, customer_support_agent_mem, support_chatbot
+    # and harness_support_chatbot -- all still billing while reported as kept.
+    'customer_support',    # project 1/2 runtime + memory (underscore variant)
+    'support_chatbot',     # project 1 runtime + memory (underscore variant)
+    'harness_support',     # project 1 harness runtime
+    'bug-report'           # project 1 bug-report tool stack, gateway, lambda, table
 ) + $ExtraPatterns
 
 function Test-IsTarget([string] $Name) {

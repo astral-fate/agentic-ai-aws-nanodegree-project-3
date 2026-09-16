@@ -1,0 +1,8 @@
+NovaMart submission — packaged 2026-09-16T20:50:47Z by deploy-e2e v05
+
+Deployed resources — account 212626318772, us-east-1
+  Runtime ARN     arn:aws:bedrock-agentcore:us-east-1:212626318772:runtime/udacity_agentcore_runtime-9aZQEd909A
+  Guardrail       vsx504bp4kea (1)
+  Returns KB      61JQLUIHYY
+  Shipping KB     AL8HEH5D7V
+  Warranty KB     HRQX4Y3ENP

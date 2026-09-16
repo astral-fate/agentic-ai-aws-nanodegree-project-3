@@ -1,0 +1,17 @@
+scenario:         03-direct-math
+session_id:       s-live-01553310
+customer_id:      CUST-003
+message:          How much are 5 items at $29.99 with 10% off?
+expected_routing: Orchestrator answers directly - no worker routing
+xray_trace_ids:   (none found)
+xray_lookup_note: no traces found in this window yet
+error:            Parameter validation failed:
+Missing required parameter in input: "payload"
+Unknown parameter in input: "sessionId", must be one of: contentType, accept, mcpSessionId, runtimeSessionId, mcpProtocolVersion, mcpMethod, mcpName, runtimeUserId, traceId, traceParent, traceState, baggage, agentRuntimeArn, qualifier, accountId, payload
+Unknown parameter in input: "inputText", must be one of: contentType, accept, mcpSessionId, runtimeSessionId, mcpProtocolVersion, mcpMethod, mcpName, runtimeUserId, traceId, traceParent, traceState, baggage, agentRuntimeArn, qualifier, accountId, payload
+
+response:
+(empty)
+
+caveat:
+Live mode: this is the actual response from invoke_agent() against the deployed AgentCore Runtime. The X-Ray trace id below (if any) comes from a GetTraceSummaries lookup over this call's time window, not from a targeted trace id returned by invoke_agent_runtime() itself - see the module docstring for why that lookup can't be more precise than a time window from outside the container.
