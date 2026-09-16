@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest>=8.0.0
-moto[dynamodb]>=5.0.0
+# cloudformation: the offline harness publishes config.py's required
+# CloudFormation exports via a real moto stack (see harness/bootstrap.py).
+# s3: PolicyBucket/VectorBucket are provisioned by that same stack.
+moto[dynamodb,s3,cloudformation]>=5.0.0
