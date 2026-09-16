@@ -85,6 +85,21 @@ def register():
 recorded: dict[str, list] = {}
 
 
+class _StubEvents:
+    """Stand-in for botocore's meta.events - register() is a real no-op
+    call the deliverable can invoke (e.g. to hook guardrailConfiguration
+    into CreateAgentRuntime); it does not need to actually fire it here
+    since the request payload assertions only need create_agent_runtime's
+    own kwargs, not the injected field."""
+    def register(self, *args, **kwargs):
+        pass
+
+
+class _StubMeta:
+    def __init__(self):
+        self.events = _StubEvents()
+
+
 class _StubClient:
     """Records every call and returns a plausible shape.
 
@@ -94,6 +109,7 @@ class _StubClient:
     """
     def __init__(self, service):
         self._service = service
+        self.meta = _StubMeta()
 
     def __getattr__(self, op):
         def _op(**kwargs):

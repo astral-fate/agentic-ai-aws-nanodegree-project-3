@@ -1048,13 +1048,77 @@ def create_guardrail() -> tuple[str, str]:
             print(f"Guardrail already exists: {guardrail_id} (version: {guardrail_version})")
             return guardrail_id, guardrail_version
 
-    # TODO: Create the guardrail
-    # Use bedrock_client.create_guardrail() with:
-    #   - Content policy - block harmful categories at HIGH strength
-    #   - PII policy - block credit cards + SSNs; anonymize emails + phone numbers
-    #   - Topic policy - deny off-topic subjects (competitor_products, legal_threats, pricing_negotiations)
-    #   - Word policy - profanity filter
-    #   - blockedInputMessaging and blockedOutputsMessaging
+    response = bedrock_client.create_guardrail(
+        name=config.GUARDRAIL_NAME,
+        description='Enterprise safety guardrail for the NovaMart support agents',
+        contentPolicyConfig={
+            'filtersConfig': [
+                {'type': 'SEXUAL',     'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'VIOLENCE',   'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'HATE',       'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'INSULTS',    'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+                {'type': 'MISCONDUCT', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            ]
+        },
+        sensitiveInformationPolicyConfig={
+            'piiEntitiesConfig': [
+                {'type': 'CREDIT_DEBIT_CARD_NUMBER',  'action': 'BLOCK'},
+                {'type': 'US_SOCIAL_SECURITY_NUMBER', 'action': 'BLOCK'},
+                {'type': 'EMAIL',                     'action': 'ANONYMIZE'},
+                {'type': 'PHONE',                     'action': 'ANONYMIZE'},
+            ]
+        },
+        topicPolicyConfig={
+            'topicsConfig': [
+                {
+                    'name': 'CompetitorProducts',
+                    'definition': 'Discussion, comparison or recommendation of '
+                                  'competitor retailers or their products.',
+                    'examples': ['Is this cheaper on another site?',
+                                 'Should I buy this from a competitor instead?'],
+                    'type': 'DENY',
+                },
+                {
+                    'name': 'PricingNegotiation',
+                    'definition': 'Attempts to negotiate prices, demand discounts '
+                                  'beyond published policy, or bargain over refunds.',
+                    'examples': ['Give me 50% off or I walk',
+                                 'Can you beat that price?'],
+                    'type': 'DENY',
+                },
+                {
+                    'name': 'LegalThreats',
+                    'definition': 'Threats of legal action, lawsuits, regulatory '
+                                  'complaints or attorney involvement.',
+                    'examples': ['My lawyer will be in touch',
+                                 'I am going to sue NovaMart'],
+                    'type': 'DENY',
+                },
+            ]
+        },
+        wordPolicyConfig={
+            'managedWordListsConfig': [{'type': 'PROFANITY'}]
+        },
+        blockedInputMessaging=(
+            "I'm not able to help with that one, but I'd be glad to help with "
+            "your order, a return, or a question about our policies."
+        ),
+        blockedOutputsMessaging=(
+            "I'm not able to share a response to that. Let me know if there's "
+            "something about your order or our policies I can help with."
+        ),
+    )
+
+    guardrail_id = response['guardrailId']
+
+    # A DRAFT guardrail is not a deployable one - promote it to a numbered version.
+    version_response = bedrock_client.create_guardrail_version(
+        guardrailIdentifier=guardrail_id,
+        description='Initial published version',
+    )
+    guardrail_version = version_response['version']
+
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
@@ -1138,16 +1202,31 @@ def deploy_to_agentcore_runtime(
     )
     print(f"  Artifact uploaded: s3://{config.POLICY_BUCKET}/{artifact_key}")
 
-    # TODO: Deploy to AgentCore Runtime
-    # Use agentcore_control.create_agent_runtime() with:
-    #   - agentRuntimeName (runtime_name), description, roleArn
-    #   - networkConfiguration (PUBLIC)
-    #   - protocolConfiguration (MCP)
-    #   - agentRuntimeArtifact pointing to the S3 zip uploaded above
-    #     (bucket: config.POLICY_BUCKET, prefix: artifact_key, runtime: PYTHON_3_12)
-    #   - environmentVariables (AWS_REGION, PROJECT_NAME, KB IDs, AGENT_LOG_GROUP)
-    # Note: guardrailConfiguration is injected automatically via the event hook above.
-    # Return: response.get('agentRuntimeArn', response.get('arn', ''))
+    response = agentcore_control.create_agent_runtime(
+        agentRuntimeName=runtime_name,
+        description='NovaMart multi-agent customer support orchestrator',
+        roleArn=config.AGENTCORE_ROLE_ARN,
+        agentRuntimeArtifact={
+            'bucket':   config.POLICY_BUCKET,
+            'prefix':   artifact_key,
+            'runtime':  'PYTHON_3_12',
+        },
+        networkConfiguration={'networkMode': 'PUBLIC'},
+        protocolConfiguration={'serverProtocol': 'HTTP'},
+        environmentVariables={
+            'AWS_REGION':        config.AWS_REGION,
+            'PROJECT_NAME':      config.PROJECT_NAME,
+            'RETURNS_KB_ID':     config.RETURNS_KB_ID,
+            'SHIPPING_KB_ID':    config.SHIPPING_KB_ID,
+            'WARRANTY_KB_ID':    config.WARRANTY_KB_ID,
+            'AGENT_LOG_GROUP':   config.AGENT_LOG_GROUP,
+            'GUARDRAIL_ID':      guardrail_id,
+            'GUARDRAIL_VERSION': guardrail_version,
+        },
+    )
+    # Note: guardrailConfiguration is also injected automatically via the
+    # event hook registered above.
+    return response.get('agentRuntimeArn', response.get('arn', ''))
 
 
 # ═══════════════════════════════════════════════════════
