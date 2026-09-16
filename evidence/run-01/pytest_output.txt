@@ -1,0 +1,26 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.0.3, pluggy-1.6.0
+rootdir: D:\aws nano\agentic-ai-aws-nanodegree-project-3
+configfile: pytest.ini
+plugins: anyio-4.13.0, hypothesis-6.152.9, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 61 items
+
+tests_offline\test_adversarial.py ..                                     [  3%]
+tests_offline\test_bootstrap.py ...                                      [  8%]
+tests_offline\test_cleanup.py .....                                      [ 16%]
+tests_offline\test_cloudshell_build.py ....                              [ 22%]
+tests_offline\test_communication_agent.py ...                            [ 27%]
+tests_offline\test_deploy.py .                                           [ 29%]
+tests_offline\test_guardrail.py ..                                       [ 32%]
+tests_offline\test_inventory_agent.py .....                              [ 40%]
+tests_offline\test_memory_observability.py ..                            [ 44%]
+tests_offline\test_orchestrator.py ............                          [ 63%]
+tests_offline\test_policy_agent.py ......                                [ 73%]
+tests_offline\test_provenance.py ..                                      [ 77%]
+tests_offline\test_refund_agent.py .......                               [ 88%]
+tests_offline\test_scenarios.py ...                                      [ 93%]
+tests_offline\test_scripted_model.py ..                                  [ 96%]
+tests_offline\test_workflow_state.py ..                                  [100%]
+
+============================= 61 passed in 18.07s =============================

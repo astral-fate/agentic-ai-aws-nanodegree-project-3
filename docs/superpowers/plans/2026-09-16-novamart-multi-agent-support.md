@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the 22 TODO bodies in `src/agent_orchestrator.py` so that `python tests/test_agent.py all` scores 120/120 against live AWS, and ship the offline harness, one-paste CloudShell deploy script, and evidence tooling around it.
+**Goal:** Implement the 34 TODO bodies in `src/agent_orchestrator.py` so that `python tests/test_agent.py all` scores 120/120 against live AWS, and ship the offline harness, one-paste CloudShell deploy script, and evidence tooling around it.
 
 **Architecture:** Five Strands agents in an Orchestrator → Workers hierarchy sharing a DynamoDB WorkflowState record with optimistic locking. The Policy agent fans out to three retriever sub-agents in parallel over three Bedrock Knowledge Bases. An offline harness registers stand-ins in `sys.modules` before importing the deliverable, so the graded file is tested without being edited or copied. A generated, self-contained bash script deploys the whole stack from AWS CloudShell in one paste.
 
@@ -35,7 +35,7 @@
 | `infrastructure/starter_stack.yaml` | DynamoDB, S3, S3 Vectors, IAM, CloudWatch | starter, untouched |
 | `infrastructure/seed_data.py` | Seeds tables and policy docs | starter, untouched |
 | `infrastructure/cleanup.py` | Deletes everything, dry-run by default | **ours**, Task 11 |
-| `src/agent_orchestrator.py` | The graded deliverable — 22 TODO bodies | **ours**, Tasks 4–10 |
+| `src/agent_orchestrator.py` | The graded deliverable — 34 TODO bodies | **ours**, Tasks 4–10 |
 | `src/agent_utils.py` | Terminal trace UI, `AgentTrace` | starter, untouched |
 | `src/agent_observability.py` | X-Ray `@tool` wrapper, `apply_observability_config` | starter, untouched |
 | `src/bedrock_kb_retrieval.py` | `retrieve_from_knowledge_base`, `format_kb_results` | starter, untouched |
