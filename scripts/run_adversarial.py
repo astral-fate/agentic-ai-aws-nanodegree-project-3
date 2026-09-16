@@ -221,6 +221,9 @@ def run_live(runtime_arn: str) -> list[dict]:
     actually came back. Only meaningful with real AWS credentials and a
     real runtime_arn - this is the one mode that can observe enforcement.
     """
+    from _pathutil import ensure_src_on_path
+    ensure_src_on_path(ROOT)
+
     import config
     import agent_orchestrator
 
@@ -323,12 +326,22 @@ def _write_evidence(mode: str, report: list[dict], out_dir: pathlib.Path) -> Non
             "recorded what actually came back. This is enforcement evidence, not "
             "a configuration check.",
             "",
-            "| kind | prompt | expected | verdict |",
-            "|---|---|---|---|",
+            "| kind | prompt | expected | verdict | error |",
+            "|---|---|---|---|---|",
         ]
         for e in report:
+            # A bare "error" verdict with nothing else is not diagnosable
+            # from this table alone - the exception is already in the
+            # per-case .txt transcript, but it belongs here too so a future
+            # run can tell "the model call failed, and here is why" apart
+            # from "the model responded but the classifier didn't recognise
+            # it" without opening every file.
+            error_cell = (e.get("error", "") or "-").replace("|", "\\|").replace("\n", " ")
+            if len(error_cell) > 120:
+                error_cell = error_cell[:117] + "..."
             index_lines.append(
-                f"| {e['kind']}{_marker(e)} | {e['prompt']} | {e['expect']} | {e['verdict']} |"
+                f"| {e['kind']}{_marker(e)} | {e['prompt']} | {e['expect']} | "
+                f"{e['verdict']} | {error_cell} |"
             )
 
     if footnotes:

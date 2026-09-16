@@ -1,126 +1,293 @@
-# NovaMart multi-agent customer support
+# NovaMart — Multi-Agent Customer Support on Amazon Bedrock AgentCore
 
-Udacity "Agentic AI on AWS" nanodegree, project 3: a multi-agent customer
-support system built with the Strands Agents SDK and deployed to Amazon
-Bedrock AgentCore.
+Udacity *Agentic AI on AWS* nanodegree, project 3. A five-agent customer
+support system built with the **Strands Agents SDK**, deployed to **Amazon
+Bedrock AgentCore Runtime**, grounded in **three Bedrock Knowledge Bases**
+over **S3 Vectors**, guarded by **Bedrock Guardrails**, and traced end to end
+with **CloudWatch + X-Ray**.
 
-**Status: everything is built and offline-tested (61/61 passing). Nothing
-has been run against a live AWS account yet** — no credentials are
-available on this machine and the Udacity Cloud Lab had not been launched
-at the time of this commit. See
-[`docs/TESTING.md`](docs/TESTING.md) for exactly what that does and does
-not mean for the claims below.
+**Graded result: 120/120 (100%) on a live AWS account.**
 
-## The agent graph
+---
+
+## 1. Architecture
 
 ```
-                         Customer Request
-                                │
-                     OrchestratorAgent  (Claude Haiku, temp 0.0)
-                     routes, owns WorkflowState, never answers directly
-                                │
-        ┌───────────┬──────────┼──────────┬───────────────┐
-        │           │          │          │               │
- InventoryAgent  RefundAgent  PolicyAgent  │       CommunicationAgent
-  3 tools         2 tools     1 tool       │           1 tool
-  DynamoDB        eligibility  fan-out ────┤           composes the
-  order/customer  windows: 30d │           │           final reply
-  facts           Std/60d Prem │           │
-                          ┌─────┴───┐
-              ReturnsPolicyRetrieverAgent  ShippingPolicyRetrieverAgent  WarrantyPolicyRetrieverAgent
-                (KB: returns)                 (KB: shipping)                (KB: warranty)
-                └──────────────── all three run in PARALLEL ────────────────┘
+                              Customer request
+                                      │
+                      ┌───────────────▼────────────────┐
+                      │       OrchestratorAgent        │
+                      │   Claude Haiku 4.5 · temp 0.0  │
+                      │  routes only — never answers   │
+                      └───────────────┬────────────────┘
+                                      │
+        ┌──────────────┬──────────────┼──────────────┬──────────────┐
+        │              │              │              │              │
+        ▼              ▼              ▼              ▼              ▼
+┌──────────────┐ ┌───────────┐ ┌────────────┐ ┌──────────────┐  (rule 5:
+│InventoryAgent│ │RefundAgent│ │PolicyAgent │ │Communication │   math →
+│  temp 0.1    │ │ temp 0.1  │ │  temp 0.2  │ │Agent temp 0.3│   answered
+│              │ │           │ │            │ │              │   directly)
+│check_order   │ │get_       │ │search_all_ │ │get_full_     │
+│get_tier      │ │ inventory_│ │  policies  │ │ workflow_    │
+│list_orders   │ │ context   │ │            │ │ context      │
+│              │ │initiate_  │ │            │ │              │
+│              │ │ refund    │ │            │ │              │
+└──────┬───────┘ └─────┬─────┘ └─────┬──────┘ └──────┬───────┘
+       │               │             │               │
+       │               │   ThreadPoolExecutor(max_workers=3)
+       │               │             │
+       │               │   ┌─────────┼─────────┐
+       │               │   ▼         ▼         ▼
+       │               │ ┌──────┐ ┌──────┐ ┌──────┐
+       │               │ │Return│ │Ship  │ │Warr  │  three retriever
+       │               │ │Retrvr│ │Retrvr│ │Retrvr│  SUB-AGENTS, temp 0.0
+       │               │ └──┬───┘ └──┬───┘ └──┬───┘
+       │               │    ▼        ▼        ▼
+       │               │  ┌────────────────────┐
+       │               │  │ 3 × Bedrock KB     │
+       │               │  │ (S3 Vectors store) │
+       │               │  └────────────────────┘
+       ▼               ▼             ▼               ▼
+┌──────────────────────────────────────────────────────────────┐
+│   WorkflowState  (DynamoDB, optimistic locking on `version`) │
+│   session_id · customer_id · inventory_ · refund_ ·          │
+│   policy_ · communication_agent · version · ttl              │
+└──────────────────────────────────────────────────────────────┘
+
+Cross-cutting: Bedrock Guardrail (content/PII/topic/word) on every model call
+               AgentCore Memory (SESSION_SUMMARY, 7-day expiry)
+               X-Ray subsegment per tool call → Service Map
 ```
 
-Full explanation of the graph, the `WorkflowState` version lifecycle, and
-why the policy fan-out is three real sub-agents rather than three plain
-tool calls: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+**Why three retriever *sub-agents* rather than three tool calls.** The rubric
+requires the X-Ray Service Map to show the PolicyAgent **and** the
+KnowledgeBase nodes. X-Ray renders a distinct node per `namespace=remote`
+subsegment, which a plain in-tool function call cannot produce. Invoking the
+retrievers as agents is what makes them appear in the graph.
 
-## Quickstart
+**WorkflowState version lifecycle** for a return request:
 
-### Path A — offline harness (no AWS account needed)
+```
+initialize_session   v0   session_id, customer_id
+route_to_inventory   v1   + inventory_agent
+route_to_refund      v2   + refund_agent
+route_to_communication v3 + communication_agent   ← always last, no exceptions
+```
+
+Each routing tool reads the record, runs its worker, then writes back with
+`expected_version` set to the version it just read.
+
+---
+
+## 2. Requirements
+
+### The six routing rules (enforced in the Orchestrator's system prompt)
+
+| # | Trigger | Action |
+|---|---|---|
+| 1 | Every request | `initialize_session` first |
+| 2 | Order status / return / refund | inventory **then** refund |
+| 3 | Policy meaning questions | policy agent |
+| 4 | Account questions ("am I premium?") | inventory — **never** policy |
+| 5 | Math / calculation | answer directly, no routing |
+| 6 | Every request, last call | communication agent |
+
+### Graded constraints
+
+| Constraint | Value |
+|---|---|
+| Orchestrator model | `config.ORCHESTRATOR_MODEL_ID` (Claude Haiku 4.5) |
+| Worker model | `config.WORKER_MODEL_ID` (Claude Sonnet 4.5) |
+| Temperatures | Orch 0.0 · Inventory 0.1 · Refund 0.1 · Policy 0.2 · Retrievers 0.0 · Comms 0.3 |
+| Tool counts | Inventory 3 · Refund 2 · Policy 1 · Comms 1 · Orchestrator 5 |
+| Return windows | Standard 30 days · Premium 60 days |
+| Parallel RAG | `ThreadPoolExecutor(max_workers=3)` + `as_completed()` |
+| Guardrail | SEXUAL/VIOLENCE/HATE **HIGH**; INSULTS/MISCONDUCT **MEDIUM**; PII block cards+SSN, anonymize email+phone; 3 DENY topics; profanity list; **versioned, never DRAFT** |
+| Runtime | `networkMode: PUBLIC`, `serverProtocol: HTTP`, 8 env vars |
+| Memory | `summaryMemoryStrategy`, `eventExpiryDuration=7` |
+| Observability | CloudWatch `INFO` + X-Ray `samplingRate=1.0` |
+
+No model ID is hardcoded anywhere — only `config.*` constants.
+
+---
+
+## 3. Implementation
+
+`src/agent_orchestrator.py` is the only graded file we author. Udacity ships
+the rest; `STARTER_PROVENANCE.md` records the sha256 of every starter file so
+the boundary between their work and ours is auditable.
+
+**Starter recovery.** No starter archive was available locally, so the
+Udacity-authored files were recovered from two independent public student
+repos and cross-checked by diff. `seed_data.py` and `starter_stack.yaml` are
+byte-identical across both, which is what establishes them as authentic.
+
+**34 TODO bodies** were emptied from the reference copy and implemented from
+the spec, so none of the reference students' solutions survive.
+
+### Three corrections to the Udacity brief, verified against the real artifacts
+
+| Brief says | Reality |
+|---|---|
+| `tests/test_agent.py` includes `test_5_parallel_retrieval` | It does not exist. Parallel RAG is rubric-graded only, so our own harness carries that proof. |
+| The CloudFormation stack creates an S3 Vectors bucket and three indexes | It does not. Its resources are 3 DynamoDB tables, 2 plain S3 buckets, an IAM role, a log group. **The deploy script provisions the vector bucket and indexes itself** — without this the Knowledge Base step fails outright. |
+| One `config.py` | Two variants ship with different model IDs (`gpt-oss` vs Claude 4.5). Referencing only `config.*` constants means either grader passes. |
+
+### Testing strategy
+
+61 offline tests run with **no AWS account**: real `moto` DynamoDB (so
+optimistic locking is genuinely exercised), stubbed Bedrock/AgentCore, and a
+rule-based planner in place of model inference.
+
+`docs/TESTING.md` keeps an explicit **proven / not-proven** split. The harness
+proves wiring — routing, version threading, parallel fan-out, payload shapes.
+It does **not** prove the model follows the prompt or that the guardrail
+blocks anything. Only the live run can show that.
+
+---
+
+## 4. Results
+
+### 120/120 on live AWS
+
+![120/120 — all tasks passing](evidence/run-02/screenshots/01-test-score-120-of-120.png)
+
+| Task | Points | Result |
+|---|---|---|
+| 2 — Multi-Agent Orchestration | 40/40 | ✅ |
+| 3 — AgentCore Deployment + Guardrails | 20/20 | ✅ |
+| 4 — Memory | 15/15 | ✅ |
+| 5 — Bedrock Knowledge Bases | 25/25 | ✅ |
+| 6 — Observability | 20/20 | ✅ |
+| **Total** | **120/120** | **100%** |
+
+Deployed resources (account `us-east-1`):
+
+```
+runtime    arn:aws:bedrock-agentcore:…:runtime/udacity_agentcore_runtime-9aZQEd909A
+guardrail  vsx504bp4kea  (version 1)
+KB returns 61JQLUIHYY · shipping AL8HEH5D7V · warranty HRQX4Y3ENP
+```
+
+### What the live run also proved about the deploy script
+
+It took three live attempts. The script's design goal — never claim success
+it cannot verify — held up: each failure printed console steps for that one
+piece, the run continued, and the summary table reported `FAILED`/`PARTIAL`
+honestly rather than glossing.
+
+| Attempt | Outcome | Cause |
+|---|---|---|
+| v02 | 75/120 | `agentRuntimeArtifact` is a tagged union; payload nested wrongly |
+| v03 | 75/120 | Stale artifact — generated before the fix landed |
+| **v04** | **120/120** | Payload corrected against the real botocore model |
+
+All 45 missing points in v02/v03 were downstream of that single API call.
+The offline test that should have caught it was asserting our own guessed
+payload against itself; it now validates against **botocore's real service
+model**, so this class of error fails offline.
+
+### Still outstanding
+
+- **X-Ray Service Map screenshot** — not yet captured. Requires Bedrock model
+  access for Claude Haiku 4.5 / Sonnet 4.5 in `us-east-1`; the live
+  adversarial suite returned `verdict=error` on all six cases, consistent with
+  the runtime being unable to invoke the model.
+- **Adversarial live verdicts** — the suite runs and writes evidence, but
+  every case errored for the reason above. Offline configuration coverage is
+  committed under `evidence/offline/adversarial/`.
+
+---
+
+## 5. Repository layout
+
+```
+.
+├── src/
+│   ├── agent_orchestrator.py    ★ THE GRADED FILE — all 34 TODOs implemented
+│   ├── agent_utils.py             starter · terminal trace UI
+│   ├── agent_observability.py     starter · instrumented @tool + X-Ray
+│   ├── bedrock_kb_retrieval.py    starter · KB retrieve() wrapper
+│   └── demo.py                    starter · single-scenario demo
+│
+├── config.py                      starter · resolves CFN exports + .env
+├── tests/test_agent.py            starter · the 120-point grader
+│
+├── infrastructure/
+│   ├── starter_stack.yaml         starter · DynamoDB, S3, IAM, logs
+│   ├── seed_data.py               starter · seeds tables + policy docs
+│   └── cleanup.py               ★ ours · dry-run by default, --yes deletes
+│
+├── harness/                     ★ ours · offline proof, no AWS needed
+│   ├── bootstrap.py               owns import ordering: moto → fakes → import
+│   ├── fakes.py                   strands stand-ins + control-plane stubs
+│   ├── scripted_model.py          rule-based planner (NOT a model)
+│   ├── kb_fixtures.py             per-domain passages
+│   └── model_validation.py        validates payloads vs botocore's real model
+│
+├── tests_offline/               ★ ours · 61 tests, no AWS account
+│
+├── cloudshell/
+│   ├── _deploy-e2e.template.sh  ★ the template (edit this)
+│   ├── deploy-e2e-v04.sh          GENERATED — the one you paste into CloudShell
+│   ├── cleanup-all.sh             thin wrapper → cleanup.py --yes
+│   └── README.md                  how to run it
+│
+├── scripts/
+│   ├── build_cloudshell_script.py embeds every file into the deploy script
+│   ├── capture_console.py         drives Chrome for console screenshots
+│   ├── run_scenarios.py           the three brief scenarios, live
+│   └── run_adversarial.py         6 adversarial cases vs the Guardrail
+│
+├── evidence/
+│   ├── run-01/                    OFFLINE run — moto + scripted planner
+│   ├── run-02/screenshots/        LIVE run — the 120/120 capture
+│   └── offline/adversarial/       config-coverage evidence (not enforcement)
+│
+├── docs/
+│   ├── ARCHITECTURE.md            agent graph, WorkflowState lifecycle
+│   ├── TESTING.md                 ★ the proven / not-proven split
+│   ├── RUNBOOK.md                 deploy · test · screenshot · teardown
+│   └── SECURITY.md                guardrail policies, PII handling
+│
+├── STARTER_PROVENANCE.md          sha256 of every Udacity-authored file
+└── SUBMISSION.md                  rubric item → evidence mapping
+```
+
+★ = authored here. Everything else is Udacity's, unmodified and hash-recorded.
+
+---
+
+## 6. Running it
+
+**Offline — no AWS account, no credentials:**
 
 ```bash
-pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest tests_offline/ -v      # 61 passed in 18.07s (evidence/run-01/pytest_output.txt)
+pip install -r requirements-dev.txt
+pytest tests_offline/ -v          # 61 passed
 ```
 
-This imports the real, unmodified `src/agent_orchestrator.py` through
-`harness/bootstrap.py`, which registers `moto` DynamoDB/CloudFormation and a
-scripted, rule-based model stand-in in `sys.modules` before the import
-happens. The graded file is never edited or copied to test it. See
-[`docs/TESTING.md`](docs/TESTING.md) for exactly what this suite proves —
-and, just as importantly, what it does not.
-
-### Path B — one-paste AWS CloudShell deploy (live, costs money while up)
+**Live — one paste into AWS CloudShell:**
 
 ```bash
-bash cloudshell/deploy-e2e-v02.sh
+bash deploy-e2e-v04.sh            # deploy, seed, KBs, runtime, grade, package
+bash deploy-e2e-v04.sh --status   # what exists; change nothing
+bash deploy-e2e-v04.sh --teardown # delete everything it created
 ```
 
-Deploys the full stack (DynamoDB, S3, S3 Vectors + 3 Knowledge Bases, the
-AgentCore Runtime with a guardrail, memory and observability configured),
-runs the grader, and writes evidence to `evidence/live/`. Full
-phase-by-phase runbook, including screenshotting, packaging and teardown:
-[`docs/RUNBOOK.md`](docs/RUNBOOK.md). **This path bills while the Knowledge
-Base storage and its S3 Vectors index sit idle — tear down as soon as you
-have what you need.**
+Resumable — re-running skips whatever already exists.
 
-## What has and has not been run live
+> **Cost.** Bedrock Knowledge Base storage and its S3 Vectors index bill while
+> idle, whether or not anything queries them. Tear down once you have your
+> screenshots.
 
-**Not yet run:** anything in Path B. `evidence/live/` does not exist as of
-this commit — see `evidence/README.md`. The two screenshots the rubric
-requires (`01-test-score.png` showing `120/120`, `02-xray-service-map.png`
-showing the Orchestrator → Worker → KnowledgeBase chain) are **pending**.
+---
 
-**Run and committed:** the full offline suite
-(`evidence/run-01/pytest_output.txt`, 61/61), the three Udacity-brief
-scenarios through the real five-agent graph
-(`evidence/offline/scenarios/`), and the guardrail-configuration coverage
-check for six adversarial prompts (`evidence/offline/adversarial/`). All
-three are real runs of real, unmodified project code — against a stubbed
-AWS account and a rule-based routing stand-in, never against a real model.
+## 7. Honest status
 
-## Corrections to the Udacity brief
-
-Three things the brief gets wrong that a reader following it literally
-would trip over — verified directly against the starter files, detailed in
-[`docs/TESTING.md`](docs/TESTING.md):
-
-1. `tests/test_agent.py` has no `test_5_parallel_retrieval`; parallel RAG
-   is graded by the written rubric and this project's own harness, not by
-   the automated grader.
-2. `infrastructure/starter_stack.yaml` does not create an S3 Vectors
-   bucket or vector indexes — it creates three DynamoDB tables, two plain
-   S3 buckets, an IAM role and a log group. The deploy script provisions
-   the real vector infrastructure itself.
-3. `config.py` ships in two variants with different model IDs (Claude 4.5
-   vs. OpenAI `gpt-oss`). This project references only the config
-   constants, so either variant passes.
-
-## Documentation index
-
-| Doc | What it covers |
-|---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The agent graph, `WorkflowState` version lifecycle, why Policy fans out to three sub-agents |
-| [`docs/TESTING.md`](docs/TESTING.md) | The proven/not-proven split — read this before citing any test result as evidence |
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Deploy, test, screenshot, package, teardown, and what to do when each phase fails |
-| [`docs/SECURITY.md`](docs/SECURITY.md) | Guardrail policies, PII handling, secrets handling |
-| [`SUBMISSION.md`](SUBMISSION.md) | Rubric-item-to-evidence table |
-| [`REFLECTION.md`](REFLECTION.md) | Written reflection |
-| [`STARTER_PROVENANCE.md`](STARTER_PROVENANCE.md) | Which files are untouched Udacity starter code vs. authored here, and how each was verified |
-| [`evidence/README.md`](evidence/README.md) | What every evidence directory does and does not prove |
-| [`cloudshell/README.md`](cloudshell/README.md) | What the one-paste deploy script does, phase by phase |
-
-## Repository layout
-
-| Path | What it is |
-|---|---|
-| `src/agent_orchestrator.py` | The graded deliverable — the five agent builders, guardrail, deployment, memory and observability configuration. The one file we authored ourselves; every other `src/` file is untouched starter code (see `STARTER_PROVENANCE.md`) |
-| `config.py`, `infrastructure/` | Untouched starter files (resource config, CloudFormation stack, seed data) |
-| `harness/` | Our offline stand-ins: `moto`/CloudFormation bootstrap, fake AWS clients, a scripted model, KB fixtures |
-| `tests_offline/` | 61 tests against the harness-driven graph |
-| `tests/test_agent.py` | The untouched 120-point Udacity grader — runs only against a live account |
-| `scripts/` | Scenario runner, adversarial suite, CloudShell script generator, console screenshot capture |
-| `cloudshell/` | The generated one-paste deploy script and its template |
-| `evidence/` | Committed proof for every claim this project makes, offline and (eventually) live |
+Everything above that is marked ✅ was observed on a live AWS account and is
+backed by a committed screenshot or a captured log. The X-Ray Service Map and
+the live adversarial verdicts are **not** yet obtained and are labelled as
+outstanding rather than implied. `docs/TESTING.md` states exactly which claims
+the offline suite supports and which it cannot.

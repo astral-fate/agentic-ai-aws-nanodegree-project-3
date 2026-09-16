@@ -255,6 +255,9 @@ def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
 def run_live(xray_wait: int, xray_poll_interval: int) -> list[dict]:
     """Send each scenario through the deployed runtime via invoke_agent()
     (pre-written, unmodified), then look up its X-Ray trace by time window."""
+    from _pathutil import ensure_src_on_path
+    ensure_src_on_path(ROOT)
+
     import config
     import agent_orchestrator
 

@@ -1,4 +1,5 @@
 from harness import fakes
+from harness.model_validation import validate_request
 
 
 def test_guardrail_request_has_every_required_policy(orchestrator):
@@ -6,6 +7,12 @@ def test_guardrail_request_has_every_required_policy(orchestrator):
     gid, version = orchestrator.create_guardrail()
 
     req = fakes.recorded["create_guardrail"][-1]
+
+    # Confirmed working live (the grader awarded "+10 Guardrail ... exists
+    # in Bedrock"), so this doubles as a check that the validator itself is
+    # trustworthy: if it rejected this payload, the validator would be
+    # wrong, not create_guardrail().
+    validate_request("bedrock", "CreateGuardrail", req)
 
     filters = {f["type"]: f for f in req["contentPolicyConfig"]["filtersConfig"]}
     for kind in ("SEXUAL", "VIOLENCE", "HATE"):

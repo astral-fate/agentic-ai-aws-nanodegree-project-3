@@ -127,6 +127,30 @@ _RESPONSES = {
                                 "arn:aws:bedrock-agentcore:us-east-1:000000000000:memory/offline",
                                 "status": "ACTIVE"}},
     "get_memory":              {"memory": {"status": "ACTIVE"}},
+    # apply_observability_config() reads the runtime back before calling
+    # update_agent_runtime() with the merged result, and wait_for_runtime_ready
+    # polls the same operation afterwards - 'status': 'READY' up front means
+    # that poll returns immediately instead of sleeping in a loop. The
+    # agentRuntimeArtifact shape here matches the real, corrected
+    # CreateAgentRuntime payload (see src/agent_orchestrator.py), since
+    # update_agent_runtime is required to echo it back unchanged.
+    "get_agent_runtime": {
+        "agentRuntimeId":  "offline",
+        "agentRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/offline",
+        "agentRuntimeArtifact": {
+            "codeConfiguration": {
+                "code": {"s3": {"bucket": "offline-bucket",
+                                "prefix": "agentcore-artifacts/offline/deployment.zip"}},
+                "runtime": "PYTHON_3_12",
+                "entryPoint": ["agent_orchestrator.py"],
+            }
+        },
+        "roleArn": "arn:aws:iam::000000000000:role/offline-role",
+        "networkConfiguration": {"networkMode": "PUBLIC"},
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "environmentVariables": {},
+        "status": "READY",
+    },
 }
 
 _STUBBED = {"bedrock", "bedrock-agent", "bedrock-runtime",

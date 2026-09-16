@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from harness import scripted_model
 
@@ -106,11 +108,48 @@ def test_initialize_session_refuses_a_different_customer_on_same_session(orch):
     assert "error" not in again
 
 
-def test_routing_tools_thread_the_version_they_just_read(orchestrator, orch):
-    """Each routing tool must pass the version it just read, not a constant."""
+def test_routing_tools_thread_the_version_they_just_read(orchestrator, orch, monkeypatch):
+    """Each routing tool must pass the version it just read, not a constant.
+
+    The previous version of this test asserted only the converged end state
+    (state['version'] >= 3). That cannot actually distinguish "each tool
+    threaded the version it just read" from "one tool hardcoded a stale
+    expected_version and _update_workflow_state's own retry-on-conflict loop
+    (it re-reads the current version and retries on
+    ConditionalCheckFailedException) quietly converged it to the same final
+    number anyway" - the two are indistinguishable by end state alone.
+    Confirmed by temporarily hardcoding expected_version=0 for one routing
+    tool in _run_worker: the OLD assertion (version >= 3) still passed.
+
+    This version instead spies on every expected_version argument
+    _update_workflow_state is actually called with, for one fresh session,
+    and asserts that exact sequence - which the hardcode above does change
+    (to [0, 0, ...] or similar) and which the old assertion could not see.
+    """
+    session_id = f"s-fresh-{uuid.uuid4().hex[:8]}"
+    prompt = f"I want to return my order ORD-27176 (CUST-001) {session_id}"
+
+    calls: list[int] = []
+    real_update = orchestrator._update_workflow_state
+
+    def spy(session_id, updates, expected_version, max_retries=3):
+        calls.append(expected_version)
+        return real_update(session_id, updates, expected_version, max_retries)
+
+    monkeypatch.setattr(orchestrator, "_update_workflow_state", spy)
+
     scripted_model.reset_calls()
-    orch("I want to return my order ORD-27176 (CUST-001)")
-    state = orchestrator._read_workflow_state("s-offline")
-    assert int(state["version"]) >= 3, \
-        "WorkflowState did not advance once per routing tool"
+    orch(prompt)
+
+    # A fresh session starts at version 0 (_create_workflow_state), so the
+    # three routing tools this return request triggers (inventory, refund,
+    # communication) must each read and pass back 0, then 1, then 2 -
+    # strictly increasing by exactly one, never a repeat or a constant.
+    assert calls == [0, 1, 2], (
+        f"expected_version sequence was {calls} - a routing tool passed a "
+        "stale or hardcoded version instead of the one it just read"
+    )
+
+    state = orchestrator._read_workflow_state(session_id)
+    assert int(state["version"]) == 3
     assert "inventory_agent" in state and "communication_agent" in state

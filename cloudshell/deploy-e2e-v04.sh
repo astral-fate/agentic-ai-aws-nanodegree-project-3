@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v02.sh              deploy everything, then grade it
-#     bash deploy-e2e-v02.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v02.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v02.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v02.sh --teardown   delete everything it created
+#     bash deploy-e2e-v03.sh              deploy everything, then grade it
+#     bash deploy-e2e-v03.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v03.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v03.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v03.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v02.sh --teardown
+#     bash deploy-e2e-v03.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v02.sh
+    bash cloudshell/deploy-e2e-v03.sh
 
 REFUSE
   exit 2
@@ -78,7 +78,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v02"
+SCRIPT_VERSION="v03"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -1558,6 +1558,7 @@ def deploy_to_agentcore_runtime(
     package_files = {
         'agent_orchestrator.py':   os.path.join(src_dir, 'agent_orchestrator.py'),
         'agent_utils.py':          os.path.join(src_dir, 'agent_utils.py'),
+        'agent_observability.py':  os.path.join(src_dir, 'agent_observability.py'),
         'bedrock_kb_retrieval.py': os.path.join(src_dir, 'bedrock_kb_retrieval.py'),
         'config.py':               os.path.join(root_dir, 'config.py'),
         'requirements.txt':        os.path.join(root_dir, 'requirements.txt'),
@@ -1581,10 +1582,19 @@ def deploy_to_agentcore_runtime(
         agentRuntimeName=runtime_name,
         description='NovaMart multi-agent customer support orchestrator',
         roleArn=config.AGENTCORE_ROLE_ARN,
+        # agentRuntimeArtifact is a tagged union - exactly one of
+        # containerConfiguration | codeConfiguration. codeConfiguration
+        # requires code.s3 {bucket, prefix}, runtime, and entryPoint (a list).
+        # Verified against the real bedrock-agentcore-control service model
+        # (botocore 1.43.89) - see tests_offline/test_deploy.py, which
+        # validates this exact payload with botocore's own ParamValidator
+        # rather than a hand-guessed shape.
         agentRuntimeArtifact={
-            'bucket':   config.POLICY_BUCKET,
-            'prefix':   artifact_key,
-            'runtime':  'PYTHON_3_12',
+            'codeConfiguration': {
+                'code': {'s3': {'bucket': config.POLICY_BUCKET, 'prefix': artifact_key}},
+                'runtime': 'PYTHON_3_12',
+                'entryPoint': ['agent_orchestrator.py'],
+            }
         },
         networkConfiguration={'networkMode': 'PUBLIC'},
         protocolConfiguration={'serverProtocol': 'HTTP'},
@@ -1970,12 +1980,28 @@ def deploy_all():
     runtime_arn = deploy_to_agentcore_runtime(orchestrator, guardrail_id, guardrail_version)
     print()
 
+    # Steps 4 and 5 configure optional capabilities on a runtime that already
+    # exists. A memory timeout or an observability error must not cost the
+    # points for Tasks 3/4/6 (runtime deployed, guardrail attached) by
+    # aborting deploy_all() before the ARN/guardrail lines below are ever
+    # printed - cloudshell/_deploy-e2e.template.sh's deploy_agent_phase()
+    # parses those lines out of stdout and has nothing to write to .env if
+    # this function raises first.
     print("Step 4/6: Configuring Memory...")
-    memory_arn = configure_memory(runtime_arn)
+    try:
+        memory_arn = configure_memory(runtime_arn)
+    except Exception as e:
+        print(f"  [Note] Memory configuration failed: {e}")
+        print(f"  (Runtime deployed and usable; re-run to retry Memory setup)")
+        memory_arn = None
     print()
 
     print("Step 5/6: Configuring Observability...")
-    configure_observability(runtime_arn)
+    try:
+        configure_observability(runtime_arn)
+    except Exception as e:
+        print(f"  [Note] Observability configuration failed: {e}")
+        print(f"  (Runtime deployed and usable; re-run to retry Observability setup)")
     print()
 
     print("Step 6/6: Deploying AgentCore Gateway...")
@@ -4809,6 +4835,7 @@ conclusion - that spend has stopped when it has not. So a non-credential
 failure propagates as an ordinary uncaught exception (traceback, non-zero
 exit) rather than being folded into the "nothing found" success path.
 """
+import re
 import sys
 import pathlib
 
@@ -5282,6 +5309,10 @@ def run_live(runtime_arn: str) -> list[dict]:
     actually came back. Only meaningful with real AWS credentials and a
     real runtime_arn - this is the one mode that can observe enforcement.
     """
+    src_dir = ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
     import config
     import agent_orchestrator
 
@@ -6393,8 +6424,12 @@ JSON
     }
 
   # Poll to COMPLETE — queries return nothing until the sync finishes.
+  # A terminal FAILED/STOPPED job will never become COMPLETE, so exit as soon
+  # as one is seen instead of polling the full 600s three times over (up to
+  # 30 minutes burned on a time-limited Cloud Lab session for nothing).
   local status="" waited=0
-  while [[ "$status" != "COMPLETE" && $waited -lt 600 ]]; do
+  while [[ "$status" != "COMPLETE" && "$status" != "FAILED" \
+           && "$status" != "STOPPED" && $waited -lt 600 ]]; do
     sleep 15; waited=$((waited+15))
     status=$(aws bedrock-agent list-ingestion-jobs \
       --knowledge-base-id "$kb_id" --data-source-id "$ds_id" \
@@ -6407,6 +6442,9 @@ JSON
   if [[ "$status" == "COMPLETE" ]]; then
     ok "KB ${domain} synced"
     record "KB ${domain}" "OK" "$kb_id"
+  elif [[ "$status" == "FAILED" || "$status" == "STOPPED" ]]; then
+    bad "KB ${domain} ingestion ended as ${status} — see the Bedrock console for the job's failure reasons"
+    record "KB ${domain}" "PARTIAL" "$kb_id (sync: ${status})"
   else
     warn "KB ${domain} sync ended as ${status:-UNKNOWN}"
     record "KB ${domain}" "PARTIAL" "$kb_id (sync: ${status:-UNKNOWN})"
@@ -6519,19 +6557,15 @@ run_grader() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  8. Adversarial guardrail suite (Task 13)
+#  8. Adversarial guardrail suite
 # ═════════════════════════════════════════════════════════════════════════════
-# scripts/run_adversarial.py does not exist yet — it is Task 13 of this plan.
-# This phase is wired in now so that once that task lands and the script is
-# regenerated, it activates with no template change. Until then, a missing
-# script is an expected gap, not a failure.
 run_adversarial_phase() {
   phase "Adversarial guardrail suite"
   local script="${PROJECT_DIR}/scripts/run_adversarial.py"
 
   if [[ ! -f "$script" ]]; then
-    skip "scripts/run_adversarial.py not present yet (Task 13) — skipping"
-    record "Adversarial suite" "SKIPPED" "Task 13 not yet implemented"
+    skip "scripts/run_adversarial.py not present — skipping"
+    record "Adversarial suite" "SKIPPED" "script not found"
     return 0
   fi
 

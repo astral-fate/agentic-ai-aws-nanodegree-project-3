@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v02.sh              deploy everything, then grade it
-#     bash deploy-e2e-v02.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v02.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v02.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v02.sh --teardown   delete everything it created
+#     bash deploy-e2e-v03.sh              deploy everything, then grade it
+#     bash deploy-e2e-v03.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v03.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v03.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v03.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v02.sh --teardown
+#     bash deploy-e2e-v03.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v02.sh
+    bash cloudshell/deploy-e2e-v03.sh
 
 REFUSE
   exit 2
@@ -78,7 +78,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v02"
+SCRIPT_VERSION="v03"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -686,8 +686,12 @@ JSON
     }
 
   # Poll to COMPLETE — queries return nothing until the sync finishes.
+  # A terminal FAILED/STOPPED job will never become COMPLETE, so exit as soon
+  # as one is seen instead of polling the full 600s three times over (up to
+  # 30 minutes burned on a time-limited Cloud Lab session for nothing).
   local status="" waited=0
-  while [[ "$status" != "COMPLETE" && $waited -lt 600 ]]; do
+  while [[ "$status" != "COMPLETE" && "$status" != "FAILED" \
+           && "$status" != "STOPPED" && $waited -lt 600 ]]; do
     sleep 15; waited=$((waited+15))
     status=$(aws bedrock-agent list-ingestion-jobs \
       --knowledge-base-id "$kb_id" --data-source-id "$ds_id" \
@@ -700,6 +704,9 @@ JSON
   if [[ "$status" == "COMPLETE" ]]; then
     ok "KB ${domain} synced"
     record "KB ${domain}" "OK" "$kb_id"
+  elif [[ "$status" == "FAILED" || "$status" == "STOPPED" ]]; then
+    bad "KB ${domain} ingestion ended as ${status} — see the Bedrock console for the job's failure reasons"
+    record "KB ${domain}" "PARTIAL" "$kb_id (sync: ${status})"
   else
     warn "KB ${domain} sync ended as ${status:-UNKNOWN}"
     record "KB ${domain}" "PARTIAL" "$kb_id (sync: ${status:-UNKNOWN})"
@@ -796,8 +803,17 @@ run_grader() {
   # print_score() in test_agent.py always exits 0 on a real run (it never
   # calls sys.exit on a partial score), so a clean exit code alone does not
   # mean the grade was good — the actual "Score: X/Y" line is what to trust.
+  #
+  # test_agent.py wraps that line in ANSI colour codes (Colors.BOLD before
+  # "Score:" and a colour code between "Score: " and the digits), so the
+  # digits are never actually adjacent to the literal text "Score: " in the
+  # raw bytes - a plain grep on the file as captured misses every run,
+  # including a perfect one, and the summary below would print PARTIAL/"no
+  # score line found" right next to a genuine 120/120. Strip ANSI escapes
+  # before matching.
   local score_line
-  score_line="$(grep -oE 'Score: [0-9]+/[0-9]+ pts \([0-9]+%\)' "${EVIDENCE_DIR}/pytest_output.txt" 2>/dev/null | tail -1)"
+  score_line="$(sed -r 's/\x1B\[[0-9;]*[mK]//g' "${EVIDENCE_DIR}/pytest_output.txt" 2>/dev/null \
+    | grep -oE 'Score: [0-9]+/[0-9]+ pts \([0-9]+%\)' | tail -1)"
 
   if [[ $rc -ne 0 ]]; then
     bad "grader crashed (exit $rc) — see ${EVIDENCE_DIR}/pytest_output.txt"
@@ -812,19 +828,15 @@ run_grader() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  8. Adversarial guardrail suite (Task 13)
+#  8. Adversarial guardrail suite
 # ═════════════════════════════════════════════════════════════════════════════
-# scripts/run_adversarial.py does not exist yet — it is Task 13 of this plan.
-# This phase is wired in now so that once that task lands and the script is
-# regenerated, it activates with no template change. Until then, a missing
-# script is an expected gap, not a failure.
 run_adversarial_phase() {
   phase "Adversarial guardrail suite"
   local script="${PROJECT_DIR}/scripts/run_adversarial.py"
 
   if [[ ! -f "$script" ]]; then
-    skip "scripts/run_adversarial.py not present yet (Task 13) — skipping"
-    record "Adversarial suite" "SKIPPED" "Task 13 not yet implemented"
+    skip "scripts/run_adversarial.py not present — skipping"
+    record "Adversarial suite" "SKIPPED" "script not found"
     return 0
   fi
 
@@ -1083,6 +1095,17 @@ teardown() {
     return 1
   fi
 
+  # Re-resolve PROJECT_NAME from the embedded config.py, exactly like every
+  # other phase does via materialise(). Skipping this left PROJECT_NAME set
+  # to the empty string (from main()'s placeholder), and config.py's
+  # os.environ.get('PROJECT_NAME', 'udacity-agentcore') treats an exported-
+  # but-empty env var as a real value rather than falling back - so
+  # _owned() matched every resource in the account (fail-"safe" only by
+  # accident) while _guard_account() called describe-stacks with an empty
+  # stack name and sys.exit(3)'d before anything was deleted. materialise()
+  # also re-writes the project files, which is cheap and idempotent.
+  materialise
+
   # cleanup.py does `import config`, which unconditionally does
   # `from dotenv import load_dotenv` — it needs the same venv every other
   # phase does. install_dependencies() is cheap to re-run: it no-ops
@@ -1094,15 +1117,28 @@ teardown() {
       "$PY" infrastructure/cleanup.py --yes )
   local rc=$?
 
-  rm -rf "$STATE_DIR" "$PROJECT_DIR"
-  printf '\n%sLocal state removed:%s %s, %s\n' "$GREEN" "$RESET" "$STATE_DIR" "$PROJECT_DIR"
+  # Preserve the evidence this project produced BEFORE anything is removed.
+  # Every doc here tells the user to screenshot/package evidence/live and
+  # then immediately tear down to stop the billing meter - deleting
+  # PROJECT_DIR must not also delete the proof of what ran.
+  if [[ -d "$EVIDENCE_DIR" ]] && [[ -n "$(ls -A "$EVIDENCE_DIR" 2>/dev/null)" ]]; then
+    local archive="${HOME}/novamart-evidence-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$archive"
+    cp -r "$EVIDENCE_DIR"/. "$archive"/ 2>/dev/null \
+      && printf '%sEvidence preserved:%s %s\n' "$GREEN" "$RESET" "$archive" \
+      || warn "could not copy evidence out of $EVIDENCE_DIR before teardown"
+  fi
 
   if [[ $rc -eq 0 ]]; then
+    rm -rf "$STATE_DIR" "$PROJECT_DIR"
+    printf '\n%sLocal state removed:%s %s, %s\n' "$GREEN" "$RESET" "$STATE_DIR" "$PROJECT_DIR"
     printf '%sDone.%s Verify in the console that the Knowledge Bases and S3 Vectors bucket\n' "$GREEN" "$RESET"
     printf 'are gone — those are what bill while idle.\n\n'
   else
     printf '%scleanup.py reported at least one failure — check its summary above and\n' "$YELLOW"
-    printf 'finish any remaining deletions in the AWS console.%s\n\n' "$RESET"
+    printf 'finish any remaining deletions in the AWS console.%s\n' "$RESET"
+    printf 'Local state was left in place at %s and %s so you can retry:\n' "$STATE_DIR" "$PROJECT_DIR"
+    printf '  bash %s --teardown\n\n' "${BASH_SOURCE[0]}"
   fi
 }
 

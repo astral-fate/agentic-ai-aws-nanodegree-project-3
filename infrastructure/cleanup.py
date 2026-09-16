@@ -23,6 +23,7 @@ conclusion - that spend has stopped when it has not. So a non-credential
 failure propagates as an ordinary uncaught exception (traceback, non-zero
 exit) rather than being folded into the "nothing found" success path.
 """
+import re
 import sys
 import pathlib
 
@@ -87,11 +88,40 @@ _ORDER = [
 ]
 
 
+_KB_NAME_RE = re.compile(r"^novamart-[A-Za-z0-9]+-policy-kb$")
+
+
 def _owned(name: str) -> bool:
-    """Only ever touch resources this project named."""
-    if config is None:
+    """Only ever touch resources this project named.
+
+    Three different naming conventions show up across the resources this
+    project actually creates, and a live run proved that recognising only
+    one of them makes teardown silently skip real, billing resources while
+    still reporting success:
+
+      - "{PROJECT_NAME}-..." (hyphenated) - the CloudFormation stack, the
+        policy/vector S3 buckets, the guardrail (config.GUARDRAIL_NAME).
+      - "{PROJECT_NAME with '-' -> '_'}_..." - the AgentCore Runtime and
+        Memory names, which agent_orchestrator.py builds with
+        f"{config.PROJECT_NAME}-runtime".replace('-', '_') /
+        f"{config.PROJECT_NAME}-memory".replace('-', '_'). With the
+        default PROJECT_NAME these are literally
+        "udacity_agentcore_runtime" and "udacity_agentcore_memory" - proven
+        live, and neither starts with "udacity-agentcore".
+      - "novamart-<domain>-policy-kb" - the three Knowledge Bases
+        (cloudshell/_deploy-e2e.template.sh's create_kb), named directly
+        and independently of PROJECT_NAME. Proven live as
+        "novamart-returns-policy-kb", "novamart-shipping-policy-kb" and
+        "novamart-warranty-policy-kb".
+    """
+    if config is None or not name:
         return False
-    return bool(name) and name.startswith(config.PROJECT_NAME)
+    underscored = config.PROJECT_NAME.replace('-', '_')
+    return (
+        name.startswith(config.PROJECT_NAME)
+        or name.startswith(underscored)
+        or bool(_KB_NAME_RE.match(name))
+    )
 
 
 def plan() -> list[dict]:

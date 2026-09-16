@@ -63,6 +63,30 @@ def test_owned_rejects_names_outside_the_project(orchestrator):
     assert cleanup._owned("") is False
 
 
+def test_owned_recognises_every_real_live_naming_convention(orchestrator):
+    """Regression for a live run where --yes reported success having deleted
+    nothing: _owned() only ever recognised the hyphenated
+    "{PROJECT_NAME}-..." form. These are the EXACT names a real deploy
+    created (see cloudshell/_deploy-e2e.template.sh's create_kb, and
+    agent_orchestrator.py's runtime_name/memory_name, which
+    .replace('-', '_') the project name) - not synthetic stand-ins."""
+    sys.path.insert(0, "infrastructure")
+    import cleanup
+
+    live_names = (
+        "novamart-returns-policy-kb",
+        "novamart-shipping-policy-kb",
+        "novamart-warranty-policy-kb",
+        "udacity_agentcore_runtime",
+        "udacity_agentcore_memory",
+    )
+    for name in live_names:
+        assert cleanup._owned(name) is True, \
+            f"{name!r} is a real live resource name but _owned() rejected it"
+
+    assert cleanup._owned("someone-elses-novamart-lookalike-kb") is False
+
+
 def test_one_failure_does_not_abort_the_rest(orchestrator, monkeypatch, capsys):
     sys.path.insert(0, "infrastructure")
     import cleanup

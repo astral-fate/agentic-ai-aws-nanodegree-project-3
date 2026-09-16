@@ -19,3 +19,22 @@ def test_offline_mode_asserts_payload_not_enforcement():
     report = run_adversarial.run_offline()
     assert all(r["claim"] == "config-covers-case" for r in report)
     assert all("not enforcement" in r["caveat"] for r in report)
+
+
+def test_live_index_surfaces_the_error_reason_not_just_the_verdict(tmp_path):
+    """A live run where every case errors (e.g. the model call itself
+    failed) must not leave the exception text buried in per-case .txt files
+    only - the INDEX.md summary table needs it too, so a future run can
+    diagnose itself without opening seven files."""
+    import run_adversarial
+
+    report = [{
+        "kind": "profanity", "prompt": "x", "expect": "blocked",
+        "claim": "live-runtime-response", "caveat": "c",
+        "response": "", "verdict": "error",
+        "error": "AccessDeniedException: model access not granted",
+    }]
+    run_adversarial._write_evidence("live", report, tmp_path)
+    index = (tmp_path / "INDEX.md").read_text(encoding="utf-8")
+    assert "AccessDeniedException" in index
+    assert "error" in index.lower()

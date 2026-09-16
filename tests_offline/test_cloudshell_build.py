@@ -40,3 +40,49 @@ def test_generated_script_has_unix_line_endings(tmp_path):
 def test_template_refuses_to_run_directly():
     text = pathlib.Path("cloudshell/_deploy-e2e.template.sh").read_text(encoding="utf-8")
     assert "This is the template, not the runnable script" in text
+
+
+def test_score_parser_strips_ansi_before_matching():
+    """Regression: tests/test_agent.py's print_score() wraps the score line
+    in ANSI colour codes - Colors.BOLD before "Score:" and a colour code
+    between "Score: " and the digits (see tests/test_agent.py:509-513) - so
+    the digits are never adjacent to the literal text "Score: " in the raw
+    captured bytes. A perfect 120/120 run was reported as PARTIAL/"no score
+    line found" in the summary table until run_grader() in
+    cloudshell/_deploy-e2e.template.sh stripped ANSI before matching. This
+    feeds the exact byte sequence print_score() emits for a 100% run through
+    that same sed+grep pipeline.
+
+    The sample is piped in over stdin rather than passed as a file path
+    argument: a Windows tmp_path contains backslashes, and bash.exe spawned
+    directly by a native python.exe (not another MSYS/Cygwin process)
+    mis-parses argv and can mangle them - the same documented quirk
+    test_generated_script_is_valid_bash above works around the same way.
+    """
+    sample = b"  \x1b[1mScore: \x1b[92m120/120 pts (100%)\x1b[0m\n"
+    plain_pattern = r"Score: [0-9]+/[0-9]+ pts \([0-9]+%\)"
+
+    # The old, un-stripped grep must fail on this input - proving this is a
+    # real regression test, not a vacuous one.
+    old = subprocess.run(
+        ["bash", "-c", f"grep -oE '{plain_pattern}'"],
+        input=sample, capture_output=True, timeout=10,
+    )
+    assert old.stdout.strip() == b"", \
+        "the un-stripped grep should not match a colourised score line"
+
+    # The fixed pipeline (mirrors run_grader()'s score_line extraction).
+    fixed = subprocess.run(
+        ["bash", "-c",
+         f"sed -r 's/\\x1B\\[[0-9;]*[mK]//g' | grep -oE '{plain_pattern}' | tail -1"],
+        input=sample, capture_output=True, timeout=10,
+    )
+    assert fixed.stdout.strip() == b"Score: 120/120 pts (100%)"
+
+
+def test_score_parser_pipeline_matches_the_template_verbatim():
+    """The sed/grep pipeline above must be the one actually shipped, not a
+    copy that could drift from cloudshell/_deploy-e2e.template.sh."""
+    text = pathlib.Path("cloudshell/_deploy-e2e.template.sh").read_text(encoding="utf-8")
+    assert r"sed -r 's/\x1B\[[0-9;]*[mK]//g'" in text
+    assert "score_line=" in text

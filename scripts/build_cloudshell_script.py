@@ -115,6 +115,63 @@ def build() -> str:
     return template.replace(MARKER, "\n".join(blocks))
 
 
+def extract_embedded(script: str, sentinel: str) -> str:
+    """Pull one heredoc body back out of a generated script, by sentinel.
+
+    Used by the self-check below and by tests_offline/test_cloudshell_build.py
+    to prove the embedded copy of a file is exactly what shipped - not a
+    stale build sitting in the working tree from before a source fix landed
+    (this is exactly how a live run was wasted re-hitting an already-fixed
+    ParamValidationError: the file on disk had been generated before the fix
+    to src/agent_orchestrator.py, and nothing caught the staleness before it
+    was run against a real AWS account).
+    """
+    start = f"<<'{sentinel}'\n"
+    start_idx = script.index(start) + len(start)
+    end_idx = script.index(f"\n{sentinel}\n", start_idx) + 1
+    return script[start_idx:end_idx]
+
+
+def self_check(script: str, out_path: Path) -> None:
+    """Refuse to ship a script that looks finished but is not.
+
+    Two invariants, both learned the hard way from a live run that reused a
+    stale generated file:
+
+      1. The embedded src/agent_orchestrator.py must be byte-identical to
+         the file on disk *right now* - not whatever it was when some
+         earlier build ran. A generator that silently produced a stale
+         embed would be worse than no generator at all.
+      2. A filename that looks like deploy-e2e-vNN.sh must carry the same
+         version the script's own banner prints (SCRIPT_VERSION in the
+         template). The two are supposed to be inseparable - the whole
+         point of putting the version in the filename - but --out lets a
+         caller decouple them, which is exactly what produced a v03-named
+         file that still printed and behaved like v02.
+    """
+    orch_source = ROOT / "src" / "agent_orchestrator.py"
+    embedded = extract_embedded(script, "AGENT_ORCHESTRATOR_PY_EOF")
+    on_disk = orch_source.read_text(encoding="utf-8")
+    if not on_disk.endswith("\n"):
+        on_disk += "\n"
+    if embedded != on_disk:
+        raise SystemExit(
+            "FATAL: embedded src/agent_orchestrator.py does not match the "
+            "file on disk. Do not hand-edit the generated script - fix the "
+            "source and rebuild."
+        )
+
+    match = re.match(r"deploy-e2e-(v\d+)\.sh$", out_path.name)
+    if match and match.group(1) != version():
+        raise SystemExit(
+            f"FATAL: output filename {out_path.name!r} names version "
+            f"{match.group(1)!r} but the template's SCRIPT_VERSION is "
+            f"{version()!r}. Bump SCRIPT_VERSION in the template (or drop "
+            f"the vNN suffix from --out) so the filename and the banner "
+            f"can never disagree."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -125,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
 
     script = build()
     out_path = args.out if args.out is not None else default_output_path()
+    self_check(script, out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # newline='\n' forces LF line endings regardless of platform — a CRLF
