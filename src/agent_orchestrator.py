@@ -859,21 +859,154 @@ def build_orchestrator_agent(
     Build the Orchestrator Agent that routes requests and manages WorkflowState.
     """
 
-    # TODO: Create a BedrockModel using the ORCHESTRATOR model
+    model = BedrockModel(
+        model_id=config.ORCHESTRATOR_MODEL_ID,
+        temperature=0.0,          # deterministic routing
+    )
 
-    # TODO: System prompt for the Orchestrator
+    def _run_worker(session_id: str, query: str, worker, column: str) -> dict:
+        """Read WorkflowState, run one worker, write its result back.
 
-    # TODO: Implement route_to_inventory_agent
+        The version passed to _update_workflow_state is the one just read, so
+        a concurrent write is detected rather than silently overwritten.
+        """
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {'error': f'Session {session_id} was never initialized'}
 
-    # TODO: Implement route_to_policy_agent
+        response = worker(query)
+        result = {'summary': str(response),
+                  'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
 
-    # TODO: Implement route_to_refund_agent
+        _update_workflow_state(
+            session_id,
+            {column: result},
+            expected_version=int(state['version']),
+        )
+        return result
 
-    # TODO: Implement route_to_communication_agent
+    @tool
+    def initialize_session(session_id: str, customer_id: str) -> dict:
+        """Create the shared WorkflowState record for a new customer request.
 
-    # TODO: Implement initialize_session
+        Must be the first tool called on every request. If this session_id
+        was already initialized (e.g. a retried or reused session), the
+        existing WorkflowState record is returned instead of raising.
 
-    # TODO: Instantiate and return the OrchestratorAgent
+        Args:
+            session_id:  Unique id for this conversation.
+            customer_id: The customer making the request, e.g. "CUST-001".
+
+        Returns:
+            The WorkflowState record for this session.
+        """
+        try:
+            return _create_workflow_state(session_id, customer_id)
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            return _read_workflow_state(session_id)
+
+    @tool
+    def route_to_inventory_agent(session_id: str, query: str) -> dict:
+        """Send the request to the InventoryAgent to gather order and customer facts.
+
+        Use for order status, returns and refunds (always before the refund
+        agent), and for any question about the customer's own account or tier.
+
+        Args:
+            session_id: The session whose WorkflowState to update.
+            query:      The customer's request, passed through verbatim.
+
+        Returns:
+            A dict with the agent's 'summary' and the timestamp it ran.
+        """
+        return _run_worker(session_id, query, inventory_agent, 'inventory_agent')
+
+    @tool
+    def route_to_policy_agent(session_id: str, query: str) -> dict:
+        """Send the request to the PolicyAgent for questions about policy meaning.
+
+        Use for return windows, shipping rates and warranty terms. Do NOT use
+        for questions about a specific customer's account - the PolicyAgent
+        knows policy text, not customer data.
+
+        Args:
+            session_id: The session whose WorkflowState to update.
+            query:      The customer's policy question.
+
+        Returns:
+            A dict with the agent's 'summary' and the timestamp it ran.
+        """
+        return _run_worker(session_id, query, policy_agent, 'policy_agent')
+
+    @tool
+    def route_to_refund_agent(session_id: str, query: str) -> dict:
+        """Send the request to the RefundAgent to decide return eligibility.
+
+        Always route to the inventory agent first - the RefundAgent reads its
+        findings out of WorkflowState.
+
+        Args:
+            session_id: The session whose WorkflowState to update.
+            query:      The customer's return or refund request.
+
+        Returns:
+            A dict with the agent's 'summary' and the timestamp it ran.
+        """
+        return _run_worker(session_id, query, refund_agent, 'refund_agent')
+
+    @tool
+    def route_to_communication_agent(session_id: str, query: str) -> dict:
+        """Send the request to the CommunicationAgent to compose the final reply.
+
+        This is the last tool call of every request, without exception.
+
+        Args:
+            session_id: The session whose WorkflowState to update.
+            query:      The customer's original request.
+
+        Returns:
+            A dict with the composed reply as 'summary'.
+        """
+        return _run_worker(session_id, query, communication_agent,
+                            'communication_agent')
+
+    return Agent(
+        model=model,
+        system_prompt="""You are the OrchestratorAgent for NovaMart customer support.
+
+You do not answer customer questions yourself and you do not write the
+customer's reply. You route work to specialists and keep the shared
+WorkflowState up to date.
+
+ROUTING RULES - follow them in order, every time:
+
+1. ALWAYS call initialize_session first, before anything else.
+
+2. Order status, return, or refund requests:
+   route to the inventory agent FIRST, then the refund agent.
+   The refund agent reads the inventory agent's findings, so the order
+   matters.
+
+3. Policy meaning questions - return windows, shipping rates, warranty
+   terms: route to the policy agent.
+
+4. Account questions ("what is my tier?", "am I premium?", "what are my
+   orders?"): route to the INVENTORY agent. Never the policy agent - it
+   only knows policy text, not customer data.
+
+5. Math or calculation questions: answer directly. No routing needed.
+
+6. ALWAYS finish by routing to the communication agent. It composes the
+   final customer-facing response. This is your last tool call on every
+   single request, with no exceptions.
+
+CRITICAL: you must never write the final customer-facing response yourself.
+Composing that reply is the communication agent's job, always.""",
+        tools=[initialize_session, route_to_inventory_agent,
+               route_to_policy_agent, route_to_refund_agent,
+               route_to_communication_agent],
+        name="OrchestratorAgent",
+    )
 
 
 # ═══════════════════════════════════════════════════════
