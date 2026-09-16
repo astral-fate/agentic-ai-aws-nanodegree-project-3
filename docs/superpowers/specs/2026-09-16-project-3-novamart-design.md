@@ -251,6 +251,14 @@ with `enabled=True`, `samplingRate=1.0`; pass to the pre-written
 `harness/fakes.py` registers stand-ins in `sys.modules` **before** importing
 `src/agent_orchestrator.py`. The deliverable is neither edited nor copied.
 
+Ordering is not a detail here, it is the whole mechanism. `config.py` calls
+`sts.get_caller_identity()` at module scope, and `agent_orchestrator.py` creates
+six boto3 clients at module scope (`bedrock-agent`, `bedrock-runtime`,
+`bedrock-agentcore`, `bedrock-agentcore-control`, `dynamodb`, `logs`). Every one
+of those runs on `import`. So `moto` must be started and the `strands` stand-ins
+registered before the first import of either module, and the harness must own
+that ordering rather than leaving it to test-file import order.
+
 The real/faked split is deliberate and is the thing that makes the evidence
 honest:
 
@@ -263,9 +271,16 @@ honest:
 
 ### 6.1 Tests the harness must carry
 
-- **Optimistic locking.** Two agents update one session concurrently; exactly
-  one succeeds, the loser raises on `expected_version`. Real `moto`
-  `ConditionExpression`, not a reimplementation.
+- **Optimistic locking.** The pre-written `_update_workflow_state` does *not*
+  simply fail a losing writer: it catches `ConditionalCheckFailedException`,
+  re-reads the current version and retries up to `max_retries=3`, raising
+  `RuntimeError` only when those are exhausted. So the honest tests are:
+  (a) two agents writing one session concurrently both land — neither column is
+  lost and `version` ends at 2; (b) with retries forced to exhaust, it raises
+  `RuntimeError`. Real `moto` `ConditionExpression`, not a reimplementation.
+  What our routing tools must get right is passing the version *just read* as
+  `expected_version`; the helper's retry loop covers the race, not the mistake
+  of passing a stale or hardcoded version.
 - **Parallel fan-out.** `search_all_policies` returns non-empty results from all
   three KBs, and the three retrievals overlap in time (asserted on recorded
   start/end timestamps, since the suite has no test for this).
