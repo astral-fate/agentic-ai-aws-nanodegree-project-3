@@ -1575,24 +1575,74 @@ def deploy_agentcore_gateway() -> dict:
 def invoke_agent(session_id: str, customer_id: str, user_message: str) -> str:
     """
     Invoke the deployed agent via AgentCore Runtime.
-    Pre-written - do not modify.
+
+    Corrected against the live API. The starter shipped this function calling
+    `invoke_agent_runtime(sessionId=..., inputText=...)` and reading a
+    `completion` event stream back. Against real AWS that fails before it ever
+    reaches a model:
+
+        Missing required parameter in input: "payload"
+        Unknown parameter in input: "sessionId" / "inputText"
+
+    botocore's `bedrock-agentcore` model requires `agentRuntimeArn` and a
+    `payload` blob, takes the session as `runtimeSessionId`, and returns a
+    single `response` blob rather than streamed chunks. Three further details
+    the starter's shape hid:
+
+      - `runtimeSessionId` has a **33 character minimum**, which ordinary
+        session ids like "s-live-aed4555d" do not meet, so it is extended here
+        rather than passed through and rejected.
+      - the payload is the JSON body `serve` mode parses, so its keys must
+        match what `_serve_http` reads.
+      - `response` is a streaming blob; it is read and JSON-decoded, falling
+        back to raw text when the runtime returns something else.
+
+    Args:
+        session_id:   Conversation id, threaded into WorkflowState.
+        customer_id:  The customer this request belongs to.
+        user_message: The customer's message.
+
+    Returns:
+        The agent's reply as text, or '' when the runtime returns no body.
     """
     enriched_message = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {user_message}"
 
+    # runtimeSessionId min length is 33; pad short ids rather than be rejected.
+    runtime_session_id = session_id
+    if len(runtime_session_id) < 33:
+        runtime_session_id = f"{session_id}-{uuid.uuid4().hex}"
+    runtime_session_id = runtime_session_id[:256]
+
     response = agentcore_client.invoke_agent_runtime(
         agentRuntimeArn=config.AGENTCORE_RUNTIME_ARN,
-        sessionId=session_id,
-        inputText=enriched_message,
+        runtimeSessionId=runtime_session_id,
+        contentType='application/json',
+        accept='application/json',
+        payload=json.dumps({
+            'session_id':  session_id,
+            'customer_id': customer_id,
+            'prompt':      enriched_message,
+        }).encode('utf-8'),
     )
 
-    full_response = ""
-    for event in response.get('completion', []):
-        if 'chunk' in event:
-            chunk = event['chunk']
-            if 'bytes' in chunk:
-                full_response += chunk['bytes'].decode('utf-8')
+    body = response.get('response')
+    if body is None:
+        return ''
 
-    return full_response
+    raw = body.read() if hasattr(body, 'read') else bytes(body)
+    text = raw.decode('utf-8', errors='replace')
+
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+
+    if isinstance(parsed, dict):
+        for key in ('response', 'output', 'result', 'message', 'completion'):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                return value
+    return text
 
 
 # ═══════════════════════════════════════════════════════

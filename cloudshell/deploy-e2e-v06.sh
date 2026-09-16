@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v05.sh              deploy everything, then grade it
-#     bash deploy-e2e-v05.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v05.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v05.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v05.sh --teardown   delete everything it created
+#     bash deploy-e2e-v06.sh              deploy everything, then grade it
+#     bash deploy-e2e-v06.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v06.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v06.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v06.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v05.sh --teardown
+#     bash deploy-e2e-v06.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v05.sh
+    bash cloudshell/deploy-e2e-v06.sh
 
 REFUSE
   exit 2
@@ -84,7 +84,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v05"
+SCRIPT_VERSION="v06"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -1940,24 +1940,74 @@ def deploy_agentcore_gateway() -> dict:
 def invoke_agent(session_id: str, customer_id: str, user_message: str) -> str:
     """
     Invoke the deployed agent via AgentCore Runtime.
-    Pre-written - do not modify.
+
+    Corrected against the live API. The starter shipped this function calling
+    `invoke_agent_runtime(sessionId=..., inputText=...)` and reading a
+    `completion` event stream back. Against real AWS that fails before it ever
+    reaches a model:
+
+        Missing required parameter in input: "payload"
+        Unknown parameter in input: "sessionId" / "inputText"
+
+    botocore's `bedrock-agentcore` model requires `agentRuntimeArn` and a
+    `payload` blob, takes the session as `runtimeSessionId`, and returns a
+    single `response` blob rather than streamed chunks. Three further details
+    the starter's shape hid:
+
+      - `runtimeSessionId` has a **33 character minimum**, which ordinary
+        session ids like "s-live-aed4555d" do not meet, so it is extended here
+        rather than passed through and rejected.
+      - the payload is the JSON body `serve` mode parses, so its keys must
+        match what `_serve_http` reads.
+      - `response` is a streaming blob; it is read and JSON-decoded, falling
+        back to raw text when the runtime returns something else.
+
+    Args:
+        session_id:   Conversation id, threaded into WorkflowState.
+        customer_id:  The customer this request belongs to.
+        user_message: The customer's message.
+
+    Returns:
+        The agent's reply as text, or '' when the runtime returns no body.
     """
     enriched_message = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {user_message}"
 
+    # runtimeSessionId min length is 33; pad short ids rather than be rejected.
+    runtime_session_id = session_id
+    if len(runtime_session_id) < 33:
+        runtime_session_id = f"{session_id}-{uuid.uuid4().hex}"
+    runtime_session_id = runtime_session_id[:256]
+
     response = agentcore_client.invoke_agent_runtime(
         agentRuntimeArn=config.AGENTCORE_RUNTIME_ARN,
-        sessionId=session_id,
-        inputText=enriched_message,
+        runtimeSessionId=runtime_session_id,
+        contentType='application/json',
+        accept='application/json',
+        payload=json.dumps({
+            'session_id':  session_id,
+            'customer_id': customer_id,
+            'prompt':      enriched_message,
+        }).encode('utf-8'),
     )
 
-    full_response = ""
-    for event in response.get('completion', []):
-        if 'chunk' in event:
-            chunk = event['chunk']
-            if 'bytes' in chunk:
-                full_response += chunk['bytes'].decode('utf-8')
+    body = response.get('response')
+    if body is None:
+        return ''
 
-    return full_response
+    raw = body.read() if hasattr(body, 'read') else bytes(body)
+    text = raw.decode('utf-8', errors='replace')
+
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+
+    if isinstance(parsed, dict):
+        for key in ('response', 'output', 'result', 'message', 'completion'):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                return value
+    return text
 
 
 # ═══════════════════════════════════════════════════════
