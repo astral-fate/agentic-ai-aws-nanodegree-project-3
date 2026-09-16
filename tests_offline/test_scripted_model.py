@@ -12,7 +12,6 @@ def test_kb_fixtures_are_domain_specific():
     assert returns != shipping
 
 
-@pytest.mark.xfail(reason="build_inventory_agent lands in Task 4")
 def test_scripted_model_records_tool_calls(orchestrator):
     scripted_model.reset_calls()
     agent = orchestrator.build_inventory_agent()

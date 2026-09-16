@@ -408,17 +408,91 @@ def build_inventory_agent() -> Agent:
     only retrieves data for the OrchestratorAgent to share with downstream agents.
     """
 
-    # TODO: Create a BedrockModel using the WORKER model
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+    )
 
-    # TODO: System prompt for the Inventory Agent
+    system_prompt = """You are the InventoryAgent for NovaMart customer support.
 
-    # TODO: Implement check_order_status tool
+Your job is to gather facts about orders and customers from the company's
+databases. You are a DATA GATHERER, not a decision maker.
 
-    # TODO: Implement get_customer_tier
+Rules:
+- Retrieve information accurately and report exactly what you find.
+- Never decide whether a return or refund is eligible. That is the
+  RefundAgent's job. If asked, report the facts and say the decision
+  belongs to the refund specialist.
+- If a record does not exist, say so plainly. Never invent an order,
+  a status, a tracking number or a customer tier.
+- Looking up an order requires BOTH the customer id and the order id."""
 
-    # TODO: Implement list_customer_orders
+    @tool
+    def check_order_status(customer_id: str, order_id: str) -> dict:
+        """Look up a single order and report its current status.
 
-    # TODO: Instantiate and return the Agent
+        Args:
+            customer_id: The customer who placed the order, e.g. "CUST-001".
+            order_id:    The order to look up, e.g. "ORD-27176".
+
+        Returns:
+            A dict with the order's fields (status, amount, dates), or a dict
+            with an 'error' key if no such order exists for that customer.
+        """
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        response = table.get_item(
+            Key={'customer_id': customer_id, 'order_id': order_id}
+        )
+        item = response.get('Item')
+        if not item:
+            return {'error': f'No order {order_id} found for customer {customer_id}'}
+        return dict(item)
+
+    @tool
+    def get_customer_tier(customer_id: str) -> dict:
+        """Report a customer's membership tier.
+
+        The tier decides the return window: Standard customers get 30 days,
+        Premium customers get 60.
+
+        Args:
+            customer_id: The customer to look up, e.g. "CUST-001".
+
+        Returns:
+            A dict with 'customer_id' and 'tier', or an 'error' key if the
+            customer does not exist.
+        """
+        table = dynamodb.Table(config.CUSTOMERS_TABLE)
+        response = table.get_item(Key={'customer_id': customer_id})
+        item = response.get('Item')
+        if not item:
+            return {'error': f'No customer {customer_id} found'}
+        return {'customer_id': customer_id, 'tier': item.get('tier', 'Standard')}
+
+    @tool
+    def list_customer_orders(customer_id: str) -> dict:
+        """List every order belonging to one customer.
+
+        Args:
+            customer_id: The customer whose orders to list, e.g. "CUST-001".
+
+        Returns:
+            A dict with 'customer_id', 'count', and 'orders' (a list of order
+            dicts). 'orders' is empty when the customer has none.
+        """
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        response = table.query(
+            KeyConditionExpression=Key('customer_id').eq(customer_id)
+        )
+        orders = [dict(i) for i in response.get('Items', [])]
+        return {'customer_id': customer_id, 'count': len(orders), 'orders': orders}
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[check_order_status, get_customer_tier, list_customer_orders],
+        name="InventoryAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
