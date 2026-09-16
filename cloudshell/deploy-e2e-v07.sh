@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v06.sh              deploy everything, then grade it
-#     bash deploy-e2e-v06.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v06.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v06.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v06.sh --teardown   delete everything it created
+#     bash deploy-e2e-v07.sh              deploy everything, then grade it
+#     bash deploy-e2e-v07.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v07.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v07.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v07.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v06.sh --teardown
+#     bash deploy-e2e-v07.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -48,8 +48,13 @@
 #
 #  What is still NOT verified live:
 #    - --teardown (the cleanup ownership fix landed after the live run)
-#    - the adversarial suite's live verdicts, which returned errors because
-#      the account lacked Bedrock model access for the configured models
+#    - the adversarial suite's and scenario runner's live verdicts. Both
+#      failed on earlier runs because the starter's invoke_agent() called
+#      invoke_agent_runtime with sessionId/inputText; the real API takes
+#      agentRuntimeArn plus a payload blob and a 33-char runtimeSessionId.
+#      That is corrected and guarded by an offline test, but the corrected
+#      call has not yet been observed succeeding against AWS. It was
+#      initially misdiagnosed as missing Bedrock model access — it was not.
 #
 #  Every AWS-mutating call is still treated as fallible — a failure prints
 #  the exact console steps for that one piece and the script carries on,
@@ -74,7 +79,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v06.sh
+    bash cloudshell/deploy-e2e-v07.sh
 
 REFUSE
   exit 2
@@ -84,7 +89,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v06"
+SCRIPT_VERSION="v07"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -163,8 +168,10 @@ banner() {
   printf '\n%s%s%s\n' "$YELLOW" "STATUS" "$RESET"
   printf '%s\n' "${DIM}This script HAS been run against a live AWS account: it deployed the full${RESET}"
   printf '%s\n' "${DIM}stack and scored 120/120 on the Udacity grader (evidence/run-02).${RESET}"
-  printf '%s\n' "${DIM}Not yet exercised live: --teardown, and the adversarial suite's live${RESET}"
-  printf '%s\n' "${DIM}verdicts (they need Bedrock model access for the configured models).${RESET}"
+  printf '%s
+' "${DIM}Not yet exercised live: --teardown, and the adversarial/scenario runners${RESET}"
+  printf '%s
+' "${DIM}(their invoke_agent call was corrected after the last run, not yet proven).${RESET}"
   printf '%s\n' "${DIM}Every AWS call is still treated as fallible: a failure prints console steps${RESET}"
   printf '%s\n' "${DIM}for that one piece and the run continues. Trust the summary table below.${RESET}"
   printf '\n%s%s%s\n' "$YELLOW" "COST WARNING" "$RESET"
@@ -5454,6 +5461,14 @@ def run_live(runtime_arn: str) -> list[dict]:
             entry["response"] = ""
             entry["verdict"]  = "error"
             entry["error"]    = str(exc)
+            # Print the reason inline. A bare "verdict=error" on stdout sent a
+            # live debugging session chasing Bedrock model access when the real
+            # cause was an API parameter shape, visible only by opening the
+            # transcript afterwards. The terminal should not hide it.
+            reason = " ".join(str(exc).split())
+            if len(reason) > 160:
+                reason = reason[:157] + "..."
+            print(f"           └─ {type(exc).__name__}: {reason}", flush=True)
         report.append(entry)
     return report
 
@@ -5819,11 +5834,11 @@ def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
     except Exception as exc:  # noqa: BLE001
         return [], f"could not create an X-Ray client: {exc}"
 
-    start = dt.datetime.utcfromtimestamp(start_ts - 5)
+    start = dt.datetime.fromtimestamp(start_ts - 5, dt.timezone.utc)
     deadline = time.time() + wait
     last_note = ""
     while True:
-        end = dt.datetime.utcfromtimestamp(max(end_ts, time.time()) + 1)
+        end = dt.datetime.fromtimestamp(max(end_ts, time.time()) + 1, dt.timezone.utc)
 
         if session_id:
             try:
@@ -6940,8 +6955,9 @@ ${RED}${BOLD}  ┌────────────────────�
   │  bill while idle, whether or not anything queries them.      │
   └──────────────────────────────────────────────────────────────┘${RESET}
 
-  Nothing above was verified against a live AWS account when this script
-  was written. Trust this table over the banner at the top.
+  This table reports what this run actually did, call by call. It is the
+  authority — prefer it over the banner at the top, which describes what
+  previous runs established rather than this one.
 
 EOF
 }

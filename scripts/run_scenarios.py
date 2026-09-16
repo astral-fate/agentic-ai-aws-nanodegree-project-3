@@ -211,11 +211,11 @@ def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
     except Exception as exc:  # noqa: BLE001
         return [], f"could not create an X-Ray client: {exc}"
 
-    start = dt.datetime.utcfromtimestamp(start_ts - 5)
+    start = dt.datetime.fromtimestamp(start_ts - 5, dt.timezone.utc)
     deadline = time.time() + wait
     last_note = ""
     while True:
-        end = dt.datetime.utcfromtimestamp(max(end_ts, time.time()) + 1)
+        end = dt.datetime.fromtimestamp(max(end_ts, time.time()) + 1, dt.timezone.utc)
 
         if session_id:
             try:

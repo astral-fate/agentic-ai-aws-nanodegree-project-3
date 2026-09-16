@@ -250,6 +250,14 @@ def run_live(runtime_arn: str) -> list[dict]:
             entry["response"] = ""
             entry["verdict"]  = "error"
             entry["error"]    = str(exc)
+            # Print the reason inline. A bare "verdict=error" on stdout sent a
+            # live debugging session chasing Bedrock model access when the real
+            # cause was an API parameter shape, visible only by opening the
+            # transcript afterwards. The terminal should not hide it.
+            reason = " ".join(str(exc).split())
+            if len(reason) > 160:
+                reason = reason[:157] + "..."
+            print(f"           └─ {type(exc).__name__}: {reason}", flush=True)
         report.append(entry)
     return report
 
