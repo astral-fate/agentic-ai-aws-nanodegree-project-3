@@ -6,4 +6,10 @@ venv/
 .env
 .aws-console-profile/
 *.zip
-!novamart-submission.zip
+
+# Submission build artifacts. The zip bundles a populated .env, and
+# .gitignore cannot see inside an archive - so the zip itself must be
+# ignored, not just the loose .env. Everything in it already lives in
+# the repo except that file.
+novamart-submission.zip
+cloudshell/novamart-submission/
