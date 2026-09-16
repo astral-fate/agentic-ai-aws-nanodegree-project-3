@@ -82,15 +82,77 @@ def register():
     sys.modules["strands.models"] = models
 
 
-def register_boto_stubs():
-    """Placeholder for Task 3.
+recorded: dict[str, list] = {}
 
-    Task 3 will replace this with real stubs for the Bedrock / AgentCore
-    control-plane calls (bedrock-agent, bedrock-agentcore,
-    bedrock-agentcore-control, etc.) that moto cannot emulate on its own.
-    For Task 2's purposes this is a deliberate no-op: nothing at
-    `agent_orchestrator` import time actually *calls* those clients (they
-    are only constructed and have compat event-hooks registered against
-    them), so no stub is required yet for the module to import cleanly.
+
+class _StubClient:
+    """Records every call and returns a plausible shape.
+
+    Control-plane calls (guardrail, runtime, memory) are asserted on their
+    REQUEST payload, which is what the rubric specifies. Their responses here
+    are fabricated and prove nothing about AWS.
     """
-    pass
+    def __init__(self, service):
+        self._service = service
+
+    def __getattr__(self, op):
+        def _op(**kwargs):
+            recorded.setdefault(op, []).append(kwargs)
+            return _RESPONSES.get(op, {})
+        return _op
+
+
+_RESPONSES = {
+    "create_guardrail":        {"guardrailId": "gr-offline-001", "version": "DRAFT"},
+    "create_guardrail_version": {"version": "1"},
+    "create_agent_runtime":    {"agentRuntimeArn":
+                                "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/offline"},
+    "create_memory":           {"memory": {"memoryArn":
+                                "arn:aws:bedrock-agentcore:us-east-1:000000000000:memory/offline",
+                                "status": "ACTIVE"}},
+    "get_memory":              {"memory": {"status": "ACTIVE"}},
+}
+
+_STUBBED = {"bedrock", "bedrock-agent", "bedrock-runtime",
+            "bedrock-agentcore", "bedrock-agentcore-control", "xray"}
+
+
+def register_boto_stubs():
+    """Route the services moto does not emulate to _StubClient; leave the rest to moto.
+
+    moto 5.2.3 does implement partial backends for "bedrock",
+    "bedrock-agent", "bedrock-runtime" and "bedrock-agentcore-control", but
+    none of them implement guardrail creation, and Tasks 9/10 need every
+    control-plane request payload captured on `recorded` regardless of
+    whether moto happens to understand the operation. So these five
+    services (plus "xray", whose trace-submission surface moto only
+    partially covers) are routed to `_StubClient` unconditionally, rather
+    than falling back to moto only where moto is incomplete.
+    """
+    import boto3
+    real_client = boto3.client
+
+    def client(service, *args, **kwargs):
+        if service in _STUBBED:
+            return _StubClient(service)
+        return real_client(service, *args, **kwargs)
+
+    boto3.client = client
+
+
+def patch_kb_retrieval():
+    """Point retrieve_from_knowledge_base at the fixtures.
+
+    Patching the module attribute (not editing the file) keeps the
+    do-not-modify starter untouched. This must run after `src` is on
+    sys.path (so `import bedrock_kb_retrieval` resolves) and before
+    `import agent_orchestrator` - the deliverable does `from
+    bedrock_kb_retrieval import retrieve_from_knowledge_base`, which binds
+    the name into agent_orchestrator's own namespace at import time.
+    Patching the bedrock_kb_retrieval module after agent_orchestrator is
+    already imported would leave agent_orchestrator's bound name pointing at
+    the original (real-Bedrock-calling) function.
+    """
+    import bedrock_kb_retrieval
+    from harness import kb_fixtures
+    bedrock_kb_retrieval.retrieve_from_knowledge_base = kb_fixtures.passages

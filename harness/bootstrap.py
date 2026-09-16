@@ -197,7 +197,7 @@ def load_orchestrator():
 
     from harness import fakes
     fakes.register()
-    fakes.register_boto_stubs()   # Task 3 adds Bedrock/AgentCore stubs
+    fakes.register_boto_stubs()   # Bedrock/AgentCore/xray stubs; moto handles the rest
 
     _create_stack()
 
@@ -205,6 +205,8 @@ def load_orchestrator():
     root_dir = pathlib.Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(src_dir))
     sys.path.insert(0, str(root_dir))
+
+    fakes.patch_kb_retrieval()   # must precede the import below - see fakes.py
 
     import agent_orchestrator
     _module = agent_orchestrator
