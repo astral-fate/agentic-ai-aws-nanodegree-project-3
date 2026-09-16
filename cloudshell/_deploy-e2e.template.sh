@@ -1,0 +1,902 @@
+#!/usr/bin/env bash
+#
+#  NovaMart Multi-Agent Customer Support — end-to-end AWS CloudShell deploy
+#  ─────────────────────────────────────────────────────────────────────────
+#  Self-contained. Every project file this deploy needs is embedded below;
+#  nothing is cloned and nothing is downloaded except from AWS itself.
+#  Paste this into AWS CloudShell and run it.
+#
+#     bash deploy-e2e-v01.sh              deploy everything, then grade it
+#     bash deploy-e2e-v01.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v01.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v01.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v01.sh --teardown   delete everything it created
+#
+#  ─────────────────────────────────────────────────────────────────────────
+#  COST — read this before running
+#
+#    DynamoDB, S3 objects, Lambda-free architecture      cents, or free
+#    Bedrock model invocations                           per token, small
+#    Bedrock Knowledge Base storage + S3 Vectors index   BILLS WHILE IDLE
+#
+#  The last line is the one that costs real money if you forget about it.
+#  A Knowledge Base with an S3 Vectors index left running is not free just
+#  because nothing is querying it. Finish, screenshot, then immediately:
+#
+#     bash deploy-e2e-v01.sh --teardown
+#
+#  The script prints that reminder again at the end.
+#  ─────────────────────────────────────────────────────────────────────────
+#
+#  HONESTY NOTE — read this too
+#
+#  This script was written and syntax-checked (`bash -n`), but it has NOT
+#  been executed against a live AWS account: no AWS credentials were
+#  available on the machine that wrote it, and the Udacity Cloud Lab had
+#  not been launched. Every AWS-mutating call below is therefore treated as
+#  fallible — a failure prints the exact console steps for that one piece
+#  and the script carries on with the rest, rather than claiming success it
+#  cannot verify. Check the summary table at the end of the run for what
+#  actually succeeded. This note is removed only once a live run exists as
+#  evidence (evidence/run-02 or later).
+#
+#  Resumable. State lives in ~/.novamart-state; re-running skips whatever
+#  already exists, so a dropped CloudShell session costs nothing but time.
+
+set -uo pipefail
+
+# This file is a TEMPLATE, not the deliverable. The embedded project files are
+# substituted in by scripts/build_cloudshell_script.py, which writes
+# cloudshell/deploy-e2e-<version>.sh. Running the template directly writes no
+# project files and would silently reuse whatever happens to already be on
+# disk — so refuse instead.
+#
+# This is the template, not the runnable script.
+if grep -q '^__EMBEDDED''_FILES__$' "${BASH_SOURCE[0]}" 2>/dev/null; then
+  cat >&2 <<'REFUSE'
+This is the template, not the runnable script.
+
+  Run the generated one instead, e.g.:
+
+    bash cloudshell/deploy-e2e-v01.sh
+
+REFUSE
+  exit 2
+fi
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
+# the banner prints it, so an uploaded copy can never be confused with an
+# older one sitting in the same directory.
+SCRIPT_VERSION="v01"
+
+REGION="${AWS_REGION:-us-east-1}"
+
+PROJECT_DIR="${HOME}/novamart-project"
+STATE_DIR="${HOME}/.novamart-state"
+EVIDENCE_DIR="${PROJECT_DIR}/evidence/live"
+ENV_FILE="${PROJECT_DIR}/.env"
+
+mkdir -p "$STATE_DIR"
+
+# ── Output ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; RED=$'\033[31m'
+  YELLOW=$'\033[33m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; GREEN=""; RED=""; YELLOW=""; CYAN=""; RESET=""
+fi
+
+PHASE_N=0
+phase() { PHASE_N=$((PHASE_N+1)); printf '\n%s━━ %d. %s%s\n' "$CYAN$BOLD" "$PHASE_N" "$*" "$RESET"; }
+ok()    { printf '   %s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+skip()  { printf '   %s·%s %s\n' "$DIM" "$RESET" "${DIM}$*${RESET}"; }
+warn()  { printf '   %s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+bad()   { printf '   %s✗%s %s\n' "$RED" "$RESET" "$*"; }
+die()   { bad "$*"; printf '\n%sStopped. Nothing further was attempted.%s\n' "$RED" "$RESET"; exit 1; }
+
+save()  { printf '%s' "$2" > "$STATE_DIR/$1"; }
+load()  { cat "$STATE_DIR/$1" 2>/dev/null || true; }
+have()  { [[ -n "$(load "$1")" ]]; }
+
+# Idempotent .env writer — replaces any existing line for KEY rather than
+# appending a duplicate, so a resumed run (which skips work already done)
+# still leaves .env correct instead of accumulating stale/duplicate lines.
+env_set() {
+  local key="$1" value="$2"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  touch "$ENV_FILE"
+  grep -v "^${key}=" "$ENV_FILE" > "${ENV_FILE}.tmp" 2>/dev/null || true
+  mv "${ENV_FILE}.tmp" "$ENV_FILE"
+  printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+}
+
+# Records which phases worked, for the summary table.
+RESULTS=()
+record() { RESULTS+=("$1|$2|$3"); }
+
+# Read a `NAME = "literal"` module-level assignment out of a project .py file.
+# Used so the template never hardcodes a model ID or resource name — it reads
+# config.py at run time instead, exactly like the agent code itself does.
+cfg_str() {
+  local key="$1"
+  grep -E "^${key}[[:space:]]*=" "${PROJECT_DIR}/config.py" 2>/dev/null | head -1 \
+    | sed -E 's/^[A-Za-z_]+[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/'
+}
+
+# Read the fallback literal out of `NAME = os.environ.get('ENVVAR', 'literal')`.
+cfg_env_default() {
+  local key="$1"
+  grep -E "^${key}[[:space:]]*=[[:space:]]*os\.environ\.get" "${PROJECT_DIR}/config.py" 2>/dev/null | head -1 \
+    | sed -E "s/.*os\.environ\.get\('[^']*',[[:space:]]*'([^']*)'\).*/\1/"
+}
+
+banner() {
+  printf '%s\n' "${BOLD}NovaMart Multi-Agent Customer Support — end-to-end deploy ${SCRIPT_VERSION}${RESET}"
+  printf '%s\n' "${DIM}running: ${BASH_SOURCE[0]}${RESET}"
+  printf '%s\n' "${DIM}region $REGION · project $PROJECT_NAME · state $STATE_DIR${RESET}"
+  printf '\n%s%s%s\n' "$YELLOW" "HONESTY NOTE" "$RESET"
+  printf '%s\n' "${DIM}This script is syntax-checked but has NOT been executed against a live${RESET}"
+  printf '%s\n' "${DIM}AWS account. Every AWS call below is treated as fallible: a failure prints${RESET}"
+  printf '%s\n' "${DIM}console steps for that one piece and the run continues. See the summary${RESET}"
+  printf '%s\n' "${DIM}table at the end for what actually succeeded.${RESET}"
+  printf '\n%s%s%s\n' "$YELLOW" "COST WARNING" "$RESET"
+  printf '%s\n' "${DIM}Bedrock Knowledge Base storage and its S3 Vectors index bill while idle,${RESET}"
+  printf '%s\n' "${DIM}whether or not anything queries them. Run --teardown after screenshotting.${RESET}"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  0. Write the embedded project files
+# ═════════════════════════════════════════════════════════════════════════════
+materialise() {
+  phase "Writing project files to $PROJECT_DIR"
+  mkdir -p "$PROJECT_DIR/src" "$PROJECT_DIR/tests" "$PROJECT_DIR/infrastructure" \
+           "$PROJECT_DIR/scripts" "$EVIDENCE_DIR"
+
+__EMBEDDED_FILES__
+
+  ok "config.py"
+  ok "requirements.txt"
+  ok "src/agent_orchestrator.py ($(wc -l < "$PROJECT_DIR/src/agent_orchestrator.py" 2>/dev/null) lines)"
+  ok "src/agent_utils.py"
+  ok "src/agent_observability.py"
+  ok "src/bedrock_kb_retrieval.py"
+  ok "src/demo.py"
+  ok "tests/test_agent.py"
+  ok "infrastructure/starter_stack.yaml"
+  ok "infrastructure/seed_data.py"
+  ok "infrastructure/cleanup.py"
+  record "Project files" "OK" "$PROJECT_DIR"
+
+  # Resolved after materialise, since they are read out of the embedded
+  # config.py rather than hardcoded here.
+  PROJECT_NAME="${PROJECT_NAME:-$(cfg_env_default PROJECT_NAME)}"
+  PROJECT_NAME="${PROJECT_NAME:-udacity-agentcore}"
+  STACK_NAME="$PROJECT_NAME"
+  ORCH_MODEL_ID="$(cfg_str ORCHESTRATOR_MODEL_ID)"
+  WORKER_MODEL_ID_VAL="$(cfg_str WORKER_MODEL_ID)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  1. Preflight
+# ═════════════════════════════════════════════════════════════════════════════
+preflight() {
+  phase "Preflight"
+
+  command -v aws     >/dev/null || die "aws CLI not found. Run this inside AWS CloudShell."
+  command -v python3  >/dev/null || die "python3 not found."
+  command -v jq       >/dev/null || warn "jq not found — some output parsing will be skipped."
+  command -v zip       >/dev/null || warn "zip not found — --package will fail later."
+
+  local identity account arn
+  identity="$(aws sts get-caller-identity --output json 2>/dev/null)" \
+    || die "No AWS credentials. In CloudShell these are already configured."
+  account="$(jq -r .Account 2>/dev/null <<<"$identity")"
+  arn="$(jq -r .Arn 2>/dev/null <<<"$identity")"
+  save account "$account"
+  save caller_arn "$arn"
+  ok "account $account"
+  ok "identity $arn"
+  ok "region $REGION"
+
+  case "$arn" in
+    *":root")
+      warn "Running as the account root. Prefer an IAM user or role for this." ;;
+  esac
+
+  # Model access. Checked up front — ORCH_MODEL_ID / WORKER_MODEL_ID_VAL are
+  # read out of the embedded config.py (materialise() sets them), never
+  # hardcoded here. These are inference-profile IDs (the "us." prefix), so
+  # list-foundation-models — which enumerates base model IDs — may not match
+  # them exactly; a miss here is a warning, not a failure.
+  if aws bedrock list-foundation-models --region "$REGION" \
+       --query "modelSummaries[?modelId=='${ORCH_MODEL_ID}' || modelId=='${WORKER_MODEL_ID_VAL}'].modelId" \
+       --output text 2>/dev/null | grep -q .; then
+    ok "orchestrator/worker foundation models visible"
+  else
+    warn "Could not confirm ${ORCH_MODEL_ID} / ${WORKER_MODEL_ID_VAL} via list-foundation-models."
+    warn "These may be cross-region inference profile IDs rather than base model IDs —"
+    warn "check Bedrock console → Model access if agent calls fail with AccessDenied."
+  fi
+
+  check_permissions
+}
+
+# Report every missing permission at once, before the first AWS write.
+check_permissions() {
+  local missing=()
+  aws cloudformation describe-stacks --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("cloudformation:DescribeStacks              the starter stack")
+  aws dynamodb list-tables --region "$REGION" --max-items 1 >/dev/null 2>&1 \
+    || missing+=("dynamodb:ListTables                        orders/customers/workflow tables")
+  aws s3api list-buckets >/dev/null 2>&1 \
+    || missing+=("s3:ListAllMyBuckets                        policy + vector buckets")
+  aws s3vectors list-vector-buckets --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("s3vectors:ListVectorBuckets                the Knowledge Base vector store")
+  aws bedrock list-guardrails --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("bedrock:ListGuardrails                     the enterprise guardrail")
+  aws bedrock-agent list-knowledge-bases --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("bedrock-agent:ListKnowledgeBases           the three policy KBs")
+  aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("bedrock-agentcore:ListAgentRuntimes        the deployed agent runtime")
+  aws logs describe-log-groups --region "$REGION" --limit 1 >/dev/null 2>&1 \
+    || missing+=("logs:DescribeLogGroups                     agent CloudWatch logs")
+  aws xray get-sampling-rules --region "$REGION" >/dev/null 2>&1 \
+    || missing+=("xray:GetSamplingRules                      distributed tracing")
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "all required permissions present"
+    return 0
+  fi
+
+  bad "This identity cannot deploy the project. Missing:"
+  printf '\n'
+  printf '       %s\n' "${missing[@]}"
+  cat <<EOF
+
+   Nothing has been created — this check runs before the first write.
+
+   Use the Udacity Cloud Lab credentials (Cloud Resources tab → generate
+   access keys), or any principal with the permissions above in $REGION.
+
+     export AWS_ACCESS_KEY_ID=...
+     export AWS_SECRET_ACCESS_KEY=...
+     export AWS_SESSION_TOKEN=...
+     export AWS_REGION=$REGION
+
+EOF
+  exit 1
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  2. CloudFormation
+# ═════════════════════════════════════════════════════════════════════════════
+stack_console_steps() {
+  cat <<EOF
+
+   ${BOLD}Deploy the stack by hand instead:${RESET}
+     CloudFormation console → Create stack → With new resources
+       Template   $PROJECT_DIR/infrastructure/starter_stack.yaml
+       Stack name $STACK_NAME
+       Parameters ProjectName=$PROJECT_NAME
+       Capability CAPABILITY_NAMED_IAM
+     Then re-run: bash ${BASH_SOURCE[0]}
+
+EOF
+}
+
+fetch_stack_outputs() {
+  local json value out_key
+  json="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query 'Stacks[0].Outputs' --output json 2>/dev/null)"
+  if [[ -z "$json" || "$json" == "null" ]]; then
+    warn "could not read stack outputs"
+    return 1
+  fi
+
+  for out_key in OrdersTableName CustomersTableName WorkflowStateTableName \
+                 PolicyDocumentsBucketName VectorStoreBucketName \
+                 AgentCoreRoleArn AgentLogGroupName; do
+    value="$(jq -r --arg k "$out_key" '.[] | select(.OutputKey==$k) | .OutputValue' <<<"$json" 2>/dev/null)"
+    [[ -n "$value" && "$value" != "null" ]] && save "out_${out_key}" "$value"
+  done
+
+  save policy_bucket      "$(load out_PolicyDocumentsBucketName)"
+  save vector_bucket      "$(load out_VectorStoreBucketName)"
+  save agentcore_role_arn "$(load out_AgentCoreRoleArn)"
+
+  ok "policy bucket   $(load policy_bucket)"
+  ok "vector bucket   $(load vector_bucket)"
+  ok "AgentCore role  $(load agentcore_role_arn)"
+}
+
+deploy_stack() {
+  phase "CloudFormation stack ($STACK_NAME)"
+
+  local status
+  status="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null)"
+
+  if [[ "$status" == *_COMPLETE && "$status" != "ROLLBACK_COMPLETE" ]]; then
+    skip "stack $STACK_NAME exists ($status)"
+  else
+    local out
+    if out="$(aws cloudformation deploy \
+        --template-file "$PROJECT_DIR/infrastructure/starter_stack.yaml" \
+        --stack-name "$STACK_NAME" \
+        --parameter-overrides "ProjectName=$PROJECT_NAME" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION" 2>&1)"; then
+      ok "stack $STACK_NAME deployed"
+    elif grep -qi "no changes" <<<"$out"; then
+      skip "stack $STACK_NAME already up to date"
+    else
+      bad "cloudformation deploy failed:"
+      tail -20 <<<"$out" | sed 's/^/       /'
+      stack_console_steps
+      record "CloudFormation" "FAILED" "see console steps above"
+      return 1
+    fi
+  fi
+
+  status="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null)"
+  if [[ "$status" != *_COMPLETE || "$status" == "ROLLBACK_COMPLETE" ]]; then
+    bad "stack status is ${status:-UNKNOWN}, not complete"
+    stack_console_steps
+    record "CloudFormation" "FAILED" "status=${status:-UNKNOWN}"
+    return 1
+  fi
+
+  fetch_stack_outputs
+  ok "stack status $status"
+  record "CloudFormation" "OK" "$STACK_NAME"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  3. Seed data
+# ═════════════════════════════════════════════════════════════════════════════
+seed_console_steps() {
+  cat <<EOF
+
+   ${BOLD}Seed by hand instead:${RESET}
+     python3 infrastructure/seed_data.py  (from $PROJECT_DIR, with AWS creds set)
+     or, at minimum, upload the three policy documents so the Knowledge
+     Bases have something to retrieve:
+       s3://$(load policy_bucket)/policies/returns/return_policy.txt
+       s3://$(load policy_bucket)/policies/shipping/shipping_policy.txt
+       s3://$(load policy_bucket)/policies/warranty/warranty_policy.txt
+
+EOF
+}
+
+seed_data_phase() {
+  phase "Seeding DynamoDB + policy documents (infrastructure/seed_data.py)"
+
+  local out
+  if out="$( cd "$PROJECT_DIR" && AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
+      python3 infrastructure/seed_data.py 2>&1 )"; then
+    ok "seed_data.py completed"
+    tail -6 <<<"$out" | sed 's/^/       /'
+    record "Seed data" "OK" "customers, orders, policy docs"
+  else
+    bad "seed_data.py failed:"
+    tail -20 <<<"$out" | sed 's/^/       /'
+    seed_console_steps
+    record "Seed data" "FAILED" "see console steps above"
+    return 1
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  4. Knowledge Bases ×3 — the phase with no project-2 precedent
+# ═════════════════════════════════════════════════════════════════════════════
+# Titan Embed Text v2 is the embedding model src/bedrock_kb_retrieval.py's own
+# module docstring specifies for all three Knowledge Bases. config.py has no
+# constant for it (embedding choice belongs to the Knowledge Base, not the
+# agent code), so it is named once here rather than invented per-call.
+EMBED_MODEL_ID="amazon.titan-embed-text-v2:0"
+EMBED_DIMENSION=1024
+
+vector_bucket_console_steps() {
+  local vb="$1"
+  cat <<EOF
+
+   ${BOLD}Create the S3 Vectors bucket by hand instead:${RESET}
+     S3 console → Vector buckets → Create vector bucket
+       Name   $vb
+     Then re-run: bash ${BASH_SOURCE[0]}
+
+EOF
+}
+
+index_console_steps() {
+  local vb="$1" index="$2"
+  cat <<EOF
+
+   ${BOLD}Create the ${index} index by hand instead:${RESET}
+     S3 console → Vector buckets → $vb → Create vector index
+       Name              ${index}
+       Dimensions        ${EMBED_DIMENSION}
+       Distance metric   Cosine
+       Data type         float32
+
+EOF
+}
+
+# The CFN stack provisions a general-purpose S3 bucket named for vector
+# storage and grants s3vectors:* on it, but does not itself create a native
+# S3 Vectors vector-bucket or its indexes — those are a distinct resource
+# type with no CloudFormation coverage in starter_stack.yaml, so this
+# function creates them against the S3 Vectors API before any Knowledge Base
+# can reference them.
+ensure_vector_infra() {
+  phase "S3 Vectors bucket and indexes"
+
+  local vb; vb="$(load vector_bucket)"
+  if [[ -z "$vb" ]]; then
+    bad "no vector bucket name — CloudFormation phase did not complete"
+    record "S3 Vectors bucket" "SKIPPED" "missing CloudFormation output"
+    return 1
+  fi
+
+  if aws s3vectors get-vector-bucket --vector-bucket-name "$vb" --region "$REGION" >/dev/null 2>&1; then
+    skip "vector bucket $vb exists"
+  else
+    if aws s3vectors create-vector-bucket --vector-bucket-name "$vb" --region "$REGION" >/dev/null 2>&1; then
+      ok "created vector bucket $vb"
+    else
+      bad "could not create S3 Vectors bucket $vb"
+      vector_bucket_console_steps "$vb"
+      record "S3 Vectors bucket" "MANUAL" "see console steps above"
+      return 1
+    fi
+  fi
+
+  local vb_arn
+  vb_arn="$(aws s3vectors get-vector-bucket --vector-bucket-name "$vb" --region "$REGION" \
+    --query 'vectorBucket.vectorBucketArn' --output text 2>/dev/null)"
+  save vector_bucket_arn "$vb_arn"
+  ok "$vb_arn"
+
+  local idx all_ok=1
+  for idx in returns-policy-index shipping-policy-index warranty-policy-index; do
+    if aws s3vectors get-index --vector-bucket-name "$vb" --index-name "$idx" --region "$REGION" >/dev/null 2>&1; then
+      skip "index $idx exists"
+    elif aws s3vectors create-index --vector-bucket-name "$vb" --index-name "$idx" \
+        --data-type float32 --dimension "$EMBED_DIMENSION" --distance-metric cosine \
+        --region "$REGION" >/dev/null 2>&1; then
+      ok "created index $idx"
+    else
+      bad "could not create index $idx"
+      index_console_steps "$vb" "$idx"
+      all_ok=0
+    fi
+  done
+
+  if [[ "$all_ok" -eq 1 ]]; then
+    record "S3 Vectors bucket/indexes" "OK" "$vb"
+  else
+    record "S3 Vectors bucket/indexes" "PARTIAL" "$vb — see console steps above"
+  fi
+}
+
+kb_console_steps() {
+  local domain="$1" index="$2" var="$3"
+  cat <<EOF
+
+   ${BOLD}Create the ${domain} Knowledge Base by hand instead:${RESET}
+     Bedrock console → Knowledge Bases → Create
+       Name              novamart-${domain}-policy-kb
+       IAM role          $(load agentcore_role_arn)
+       Embedding model   Titan Text Embeddings V2
+       Vector store      S3 Vectors → existing bucket $(load vector_bucket), index ${index}
+       Data source       s3://$(load policy_bucket)/policies/${domain}/
+     Sync the data source, then:
+       echo '<kb-id>' > $STATE_DIR/kb_${domain}
+       echo '${var}=<kb-id>' >> $ENV_FILE
+
+EOF
+}
+
+create_kb() {
+  local domain="$1" index="$2" var="$3"
+  local kb_id; kb_id="$(load "kb_${domain}")"
+  if [[ -n "$kb_id" ]]; then
+    skip "KB ${domain} exists (${kb_id})"
+    env_set "$var" "$kb_id"
+    return 0
+  fi
+
+  local vb_arn policy_bucket role_arn
+  vb_arn="$(load vector_bucket_arn)"
+  policy_bucket="$(load policy_bucket)"
+  role_arn="$(load agentcore_role_arn)"
+
+  if [[ -z "$vb_arn" || -z "$policy_bucket" || -z "$role_arn" ]]; then
+    bad "missing a prerequisite for the ${domain} KB (vector bucket / policy bucket / role)"
+    kb_console_steps "$domain" "$index" "$var"
+    record "KB ${domain}" "SKIPPED" "missing prerequisite"
+    return 1
+  fi
+
+  kb_id=$(aws bedrock-agent create-knowledge-base \
+    --name "novamart-${domain}-policy-kb" \
+    --role-arn "$role_arn" \
+    --knowledge-base-configuration "$(cat <<JSON
+{"type":"VECTOR",
+ "vectorKnowledgeBaseConfiguration":{
+   "embeddingModelArn":"arn:aws:bedrock:${REGION}::foundation-model/${EMBED_MODEL_ID}"}}
+JSON
+)" \
+    --storage-configuration "$(cat <<JSON
+{"type":"S3_VECTORS",
+ "s3VectorsConfiguration":{
+   "vectorBucketArn":"${vb_arn}",
+   "indexName":"${index}"}}
+JSON
+)" \
+    --region "$REGION" \
+    --query 'knowledgeBase.knowledgeBaseId' --output text 2>/dev/null) || {
+      bad "Could not create the ${domain} Knowledge Base"
+      kb_console_steps "$domain" "$index" "$var"
+      record "KB ${domain}" "MANUAL" "see console steps above"
+      return 1
+    }
+
+  save "kb_${domain}" "$kb_id"
+  ok "KB ${domain} = ${kb_id}"
+
+  local ds_id
+  ds_id=$(aws bedrock-agent create-data-source \
+    --knowledge-base-id "$kb_id" \
+    --name "${domain}-policy-docs" \
+    --data-source-configuration "$(cat <<JSON
+{"type":"S3",
+ "s3Configuration":{
+   "bucketArn":"arn:aws:s3:::${policy_bucket}",
+   "inclusionPrefixes":["policies/${domain}/"]}}
+JSON
+)" \
+    --region "$REGION" \
+    --query 'dataSource.dataSourceId' --output text 2>/dev/null) || {
+      bad "Could not create the data source for ${domain}"
+      record "KB ${domain}" "PARTIAL" "KB created, data source failed"
+      return 1
+    }
+  save "ds_${domain}" "$ds_id"
+  ok "data source $ds_id"
+
+  aws bedrock-agent start-ingestion-job \
+    --knowledge-base-id "$kb_id" --data-source-id "$ds_id" \
+    --region "$REGION" >/dev/null 2>&1 || {
+      warn "could not start the ingestion job for ${domain}"
+      record "KB ${domain}" "PARTIAL" "ingestion not started"
+      env_set "$var" "$kb_id"
+      return 1
+    }
+
+  # Poll to COMPLETE — queries return nothing until the sync finishes.
+  local status="" waited=0
+  while [[ "$status" != "COMPLETE" && $waited -lt 600 ]]; do
+    sleep 15; waited=$((waited+15))
+    status=$(aws bedrock-agent list-ingestion-jobs \
+      --knowledge-base-id "$kb_id" --data-source-id "$ds_id" \
+      --region "$REGION" \
+      --query 'ingestionJobSummaries[0].status' --output text 2>/dev/null)
+    printf '\r   syncing %s … %s (%ds)' "$domain" "$status" "$waited"
+  done
+  printf '\n'
+
+  if [[ "$status" == "COMPLETE" ]]; then
+    ok "KB ${domain} synced"
+    record "KB ${domain}" "OK" "$kb_id"
+  else
+    warn "KB ${domain} sync ended as ${status:-UNKNOWN}"
+    record "KB ${domain}" "PARTIAL" "$kb_id (sync: ${status:-UNKNOWN})"
+  fi
+
+  env_set "$var" "$kb_id"
+}
+
+ensure_kbs() {
+  phase "Bedrock Knowledge Bases (returns, shipping, warranty)"
+  ensure_vector_infra || true
+  create_kb returns  returns-policy-index  RETURNS_KB_ID
+  create_kb shipping shipping-policy-index SHIPPING_KB_ID
+  create_kb warranty warranty-policy-index WARRANTY_KB_ID
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  5. Deploy the agent
+# ═════════════════════════════════════════════════════════════════════════════
+# src/agent_orchestrator.py deploy runs the whole agent-side pipeline in one
+# call: builds the 5-agent graph, creates the enterprise guardrail, deploys
+# to AgentCore Runtime, configures Memory and CloudWatch/X-Ray observability,
+# and (best-effort) the AgentCore Gateway — then prints the three lines this
+# function parses back out.
+deploy_agent_phase() {
+  phase "Deploying the agent (src/agent_orchestrator.py deploy)"
+
+  local out
+  out="$( cd "$PROJECT_DIR" && \
+    AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
+    RETURNS_KB_ID="$(load kb_returns)" SHIPPING_KB_ID="$(load kb_shipping)" \
+    WARRANTY_KB_ID="$(load kb_warranty)" \
+    python3 src/agent_orchestrator.py deploy 2>&1 )"
+
+  mkdir -p "$EVIDENCE_DIR"
+  printf '%s\n' "$out" > "${EVIDENCE_DIR}/deploy_output.txt"
+
+  local runtime_arn guardrail_id guardrail_version
+  runtime_arn="$(grep -oE 'AGENTCORE_RUNTIME_ARN=.*' <<<"$out" | tail -1 | cut -d= -f2-)"
+  guardrail_id="$(grep -oE '^ *GUARDRAIL_ID=.*' <<<"$out" | tail -1 | sed 's/.*GUARDRAIL_ID=//')"
+  guardrail_version="$(grep -oE '^ *GUARDRAIL_VERSION=.*' <<<"$out" | tail -1 | sed 's/.*GUARDRAIL_VERSION=//')"
+
+  if [[ -z "$runtime_arn" ]]; then
+    bad "deploy did not report a runtime ARN — see ${EVIDENCE_DIR}/deploy_output.txt"
+    tail -20 <<<"$out" | sed 's/^/       /'
+    cat <<EOF
+
+   ${BOLD}Finish by hand instead:${RESET}
+     cd $PROJECT_DIR && python3 src/agent_orchestrator.py deploy
+     Then set AGENTCORE_RUNTIME_ARN / GUARDRAIL_ID / GUARDRAIL_VERSION in $ENV_FILE
+
+EOF
+    record "Agent deploy" "FAILED" "see ${EVIDENCE_DIR}/deploy_output.txt"
+    return 1
+  fi
+
+  save runtime_arn "$runtime_arn"
+  save guardrail_id "$guardrail_id"
+  save guardrail_version "$guardrail_version"
+  env_set AGENTCORE_RUNTIME_ARN "$runtime_arn"
+  env_set GUARDRAIL_ID "$guardrail_id"
+  env_set GUARDRAIL_VERSION "${guardrail_version:-DRAFT}"
+
+  ok "runtime $runtime_arn"
+  ok "guardrail $guardrail_id (${guardrail_version:-DRAFT})"
+  record "Agent deploy" "OK" "$runtime_arn"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  6. Run the Udacity grader
+# ═════════════════════════════════════════════════════════════════════════════
+# Prefers a workspace-provided tests/test_agent.py (e.g. from an earlier
+# upload into the CloudShell home directory) over the embedded copy, and
+# prints which one was used — the grader is the thing being graded, so which
+# copy ran matters.
+run_grader() {
+  phase "Running the Udacity grader (tests/test_agent.py all)"
+  mkdir -p "$EVIDENCE_DIR"
+
+  local workspace_copy="${PWD}/tests/test_agent.py"
+  if [[ -f "$workspace_copy" && "$workspace_copy" != "${PROJECT_DIR}/tests/test_agent.py" ]]; then
+    cp "$workspace_copy" "${PROJECT_DIR}/tests/test_agent.py"
+    ok "using the workspace-provided tests/test_agent.py ($workspace_copy)"
+  else
+    ok "using the embedded tests/test_agent.py"
+  fi
+
+  ( cd "$PROJECT_DIR" && \
+    set -a; [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"; set +a; \
+    AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
+    python3 tests/test_agent.py all ) 2>&1 | tee "${EVIDENCE_DIR}/pytest_output.txt"
+  local rc=${PIPESTATUS[0]}
+
+  # print_score() in test_agent.py always exits 0 on a real run (it never
+  # calls sys.exit on a partial score), so a clean exit code alone does not
+  # mean the grade was good — the actual "Score: X/Y" line is what to trust.
+  local score_line
+  score_line="$(grep -oE 'Score: [0-9]+/[0-9]+ pts \([0-9]+%\)' "${EVIDENCE_DIR}/pytest_output.txt" 2>/dev/null | tail -1)"
+
+  if [[ $rc -ne 0 ]]; then
+    bad "grader crashed (exit $rc) — see ${EVIDENCE_DIR}/pytest_output.txt"
+    record "Grader (test_agent.py all)" "FAILED" "exit $rc"
+  elif [[ -n "$score_line" ]]; then
+    ok "grader finished — $score_line"
+    record "Grader (test_agent.py all)" "OK" "$score_line"
+  else
+    warn "grader finished but no score line found — check ${EVIDENCE_DIR}/pytest_output.txt"
+    record "Grader (test_agent.py all)" "PARTIAL" "no score line found"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  7. Adversarial guardrail suite (Task 13)
+# ═════════════════════════════════════════════════════════════════════════════
+# scripts/run_adversarial.py does not exist yet — it is Task 13 of this plan.
+# This phase is wired in now so that once that task lands and the script is
+# regenerated, it activates with no template change. Until then, a missing
+# script is an expected gap, not a failure.
+run_adversarial_phase() {
+  phase "Adversarial guardrail suite"
+  local script="${PROJECT_DIR}/scripts/run_adversarial.py"
+
+  if [[ ! -f "$script" ]]; then
+    skip "scripts/run_adversarial.py not present yet (Task 13) — skipping"
+    record "Adversarial suite" "SKIPPED" "Task 13 not yet implemented"
+    return 0
+  fi
+
+  ( cd "$PROJECT_DIR" && python3 scripts/run_adversarial.py --live ) \
+    2>&1 | tee "${EVIDENCE_DIR}/adversarial_output.txt"
+  local rc=${PIPESTATUS[0]}
+  if [[ $rc -eq 0 ]]; then
+    ok "adversarial suite finished — see ${EVIDENCE_DIR}/adversarial_output.txt"
+    record "Adversarial suite" "OK" "${EVIDENCE_DIR}/adversarial_output.txt"
+  else
+    warn "adversarial suite reported failures (exit $rc)"
+    record "Adversarial suite" "PARTIAL" "${EVIDENCE_DIR}/adversarial_output.txt"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  8. Package the submission (full form is Task 14)
+# ═════════════════════════════════════════════════════════════════════════════
+# This is a minimal package — src/, tests/, infrastructure/, whatever evidence
+# exists, and a redacted .env. Task 14 adds screenshots, adversarial
+# transcripts and an INDEX.md; this gives the flag something real to do
+# until then, rather than a no-op.
+package_submission() {
+  phase "Packaging the submission"
+
+  local staging="/tmp/novamart-submission" out="${HOME}/novamart-submission.zip"
+  rm -rf "$staging" "$out"
+  mkdir -p "$staging/evidence"
+
+  cp -r "$PROJECT_DIR/src" "$staging/" 2>/dev/null
+  cp -r "$PROJECT_DIR/tests" "$staging/" 2>/dev/null
+  cp -r "$PROJECT_DIR/infrastructure" "$staging/" 2>/dev/null
+  [[ -d "$EVIDENCE_DIR" ]] && cp -r "$EVIDENCE_DIR" "$staging/evidence/live" 2>/dev/null
+
+  if [[ -f "$ENV_FILE" ]]; then
+    sed -E 's/=.*/=REDACTED/' "$ENV_FILE" > "$staging/env.redacted.txt"
+  fi
+
+  {
+    printf 'NovaMart submission — packaged %s by deploy-e2e %s\n\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_VERSION"
+    printf 'Deployed resources — account %s, %s\n' "$(load account)" "$REGION"
+    printf '  Runtime ARN     %s\n' "$(load runtime_arn)"
+    printf '  Guardrail       %s (%s)\n' "$(load guardrail_id)" "$(load guardrail_version)"
+    printf '  Returns KB      %s\n' "$(load kb_returns)"
+    printf '  Shipping KB     %s\n' "$(load kb_shipping)"
+    printf '  Warranty KB     %s\n' "$(load kb_warranty)"
+    printf '\nFull evidence capture, console screenshots and INDEX.md are added by Task 14.\n'
+  } > "$staging/DEPLOYED_RESOURCES.txt"
+
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "$staging" && zip -qr "$out" . )
+    ok "$out ($(du -h "$out" 2>/dev/null | cut -f1))"
+    printf '\n   %sDownload it:%s CloudShell → Actions → Download file → paste:\n' "$BOLD" "$RESET"
+    printf '     %s\n\n' "$out"
+    record "Package" "OK" "$out"
+  else
+    bad "zip not found — cannot package. The staged files are at $staging"
+    record "Package" "FAILED" "zip not found"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Summary, status, teardown
+# ═════════════════════════════════════════════════════════════════════════════
+summary() {
+  printf '\n%s════════════════════════════════════════════════════════════════════%s\n' "$BOLD" "$RESET"
+  printf '%s SUMMARY%s\n' "$BOLD" "$RESET"
+  printf '%s════════════════════════════════════════════════════════════════════%s\n\n' "$BOLD" "$RESET"
+
+  local entry name status detail colour
+  for entry in "${RESULTS[@]}"; do
+    IFS='|' read -r name status detail <<<"$entry"
+    case "$status" in
+      OK)       colour="$GREEN" ;;
+      PARTIAL)  colour="$YELLOW" ;;
+      SKIPPED)  colour="$DIM" ;;
+      *)        colour="$RED" ;;
+    esac
+    printf '  %-28s %s%-9s%s %s\n' "$name" "$colour" "$status" "$RESET" "$detail"
+  done
+
+  cat <<EOF
+
+  Project       $PROJECT_DIR
+  State         $STATE_DIR
+  Evidence      $EVIDENCE_DIR
+
+${RED}${BOLD}  ┌──────────────────────────────────────────────────────────────┐
+  │  TEAR DOWN WHEN YOU HAVE YOUR SCREENSHOTS                    │
+  │                                                              │
+  │     bash ${BASH_SOURCE[0]} --teardown
+  │                                                              │
+  │  Bedrock Knowledge Base storage and its S3 Vectors index      │
+  │  bill while idle, whether or not anything queries them.      │
+  └──────────────────────────────────────────────────────────────┘${RESET}
+
+  Nothing above was verified against a live AWS account when this script
+  was written. Trust this table over the banner at the top.
+
+EOF
+}
+
+show_status() {
+  printf '\n%sRecorded state%s\n\n' "$BOLD" "$RESET"
+  local key
+  for key in account caller_arn \
+             out_PolicyDocumentsBucketName out_VectorStoreBucketName out_AgentCoreRoleArn \
+             policy_bucket vector_bucket vector_bucket_arn agentcore_role_arn \
+             kb_returns kb_shipping kb_warranty \
+             ds_returns ds_shipping ds_warranty \
+             runtime_arn guardrail_id guardrail_version; do
+    printf '  %-28s %s\n' "$key" "$(load "$key")"
+  done
+  printf '\n'
+}
+
+# Delegates every deletion to infrastructure/cleanup.py — never reimplements
+# it here — and then removes only what this script itself created locally.
+# cloudshell/cleanup-all.sh does the same thing for a full git checkout.
+teardown() {
+  printf '\n%sTeardown%s — deletes everything this project created.\n' "$BOLD" "$RESET"
+  printf 'Type %sdelete%s to confirm: ' "$BOLD" "$RESET"
+  read -r reply
+  [[ "$reply" == "delete" ]] || { warn "cancelled"; return; }
+
+  if [[ ! -f "$PROJECT_DIR/infrastructure/cleanup.py" ]]; then
+    bad "no materialised project at $PROJECT_DIR — nothing to delete. Run the script once first."
+    return 1
+  fi
+
+  ( cd "$PROJECT_DIR" && AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
+      python3 infrastructure/cleanup.py --yes )
+  local rc=$?
+
+  rm -rf "$STATE_DIR" "$PROJECT_DIR"
+  printf '\n%sLocal state removed:%s %s, %s\n' "$GREEN" "$RESET" "$STATE_DIR" "$PROJECT_DIR"
+
+  if [[ $rc -eq 0 ]]; then
+    printf '%sDone.%s Verify in the console that the Knowledge Bases and S3 Vectors bucket\n' "$GREEN" "$RESET"
+    printf 'are gone — those are what bill while idle.\n\n'
+  else
+    printf '%scleanup.py reported at least one failure — check its summary above and\n' "$YELLOW"
+    printf 'finish any remaining deletions in the AWS console.%s\n\n' "$RESET"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+main() {
+  # Placeholders until materialise() reads the real values out of config.py.
+  PROJECT_NAME="${PROJECT_NAME:-}"
+  STACK_NAME="${PROJECT_NAME:-udacity-agentcore}"
+  ORCH_MODEL_ID=""
+  WORKER_MODEL_ID_VAL=""
+
+  case "${1:-}" in
+    --status)    show_status; exit 0 ;;
+    --teardown)  teardown;    exit 0 ;;
+    --test-only)
+      materialise
+      preflight
+      run_grader
+      summary
+      exit 0 ;;
+    --package)
+      materialise
+      package_submission
+      exit 0 ;;
+  esac
+
+  banner
+  materialise
+  preflight
+  deploy_stack
+  seed_data_phase
+  ensure_kbs
+  deploy_agent_phase
+  run_grader
+  run_adversarial_phase
+  package_submission
+  summary
+}
+
+main "$@"
