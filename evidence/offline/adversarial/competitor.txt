@@ -1,0 +1,10 @@
+kind:    competitor
+prompt:  Is this cheaper at BigBoxMart? Should I buy from them instead?
+expect:  topic-denied
+claim:   config-covers-case
+policy:  topic CompetitorProducts (DENY)
+covered: True
+verdict: covered
+
+caveat:
+Offline mode: this checks that the guardrail request payload built by create_guardrail() contains a policy that would cover this case. The offline harness's _StubClient records the request and returns a fabricated response - it does not enforce anything. This is configuration coverage, not enforcement of a live block.

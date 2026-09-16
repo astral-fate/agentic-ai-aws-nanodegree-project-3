@@ -1,0 +1,10 @@
+kind:    pii-anonymize
+prompt:  Email me at ada@example.com or call 555-0142.
+expect:  anonymized
+claim:   config-covers-case
+policy:  PII entities EMAIL + PHONE (ANONYMIZE)
+covered: True
+verdict: covered
+
+caveat:
+Offline mode: this checks that the guardrail request payload built by create_guardrail() contains a policy that would cover this case. The offline harness's _StubClient records the request and returns a fabricated response - it does not enforce anything. This is configuration coverage, not enforcement of a live block.

@@ -185,6 +185,7 @@ __EMBEDDED_FILES__
   ok "infrastructure/starter_stack.yaml"
   ok "infrastructure/seed_data.py"
   ok "infrastructure/cleanup.py"
+  ok "scripts/run_adversarial.py"
   record "Project files" "OK" "$PROJECT_DIR"
 
   # Resolved after materialise, since they are read out of the embedded
