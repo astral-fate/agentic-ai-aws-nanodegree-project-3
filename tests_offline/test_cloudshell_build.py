@@ -9,7 +9,8 @@ def test_generator_embeds_every_project_file(tmp_path):
                     "--out", str(out)], check=True, timeout=120)
     text = out.read_text(encoding="utf-8")
     for needed in ("agent_orchestrator.py", "config.py", "test_agent.py",
-                   "starter_stack.yaml", "seed_data.py", "cleanup.py"):
+                   "starter_stack.yaml", "seed_data.py", "cleanup.py",
+                   "_pathutil.py"):
         assert needed in text, f"{needed} was not embedded"
     assert "__EMBEDDED" + "_FILES__" not in text, "placeholder was never substituted"
 
@@ -35,6 +36,60 @@ def test_generated_script_has_unix_line_endings(tmp_path):
                     "--out", str(out)], check=True, timeout=120)
     assert b"\r\n" not in out.read_bytes(), \
         "CRLF in a bash script fails in CloudShell with $'\\r': command not found"
+
+
+def test_generator_refuses_a_version_mismatched_filename(tmp_path):
+    """Regression: a live run was wasted re-hitting an already-fixed
+    ParamValidationError because a file named deploy-e2e-v03.sh had been
+    generated (via --out) while the template's SCRIPT_VERSION was still
+    "v02" - the filename and the banner disagreed, and nothing caught it.
+    --out can still name an arbitrary path, but a "deploy-e2e-vNN.sh"-shaped
+    one must carry the version the template actually has, or the build must
+    refuse rather than write a self-contradicting artifact."""
+    out = tmp_path / "deploy-e2e-v99.sh"
+    result = subprocess.run(
+        [sys.executable, "scripts/build_cloudshell_script.py", "--out", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0
+    assert "SCRIPT_VERSION" in (result.stdout + result.stderr)
+    assert not out.exists(), "a version-mismatched file must not be written"
+
+
+def test_generated_script_embeds_the_current_agent_orchestrator_byte_for_byte(tmp_path):
+    """Regression: the generator must never let a build silently go stale -
+    the embedded copy has to be exactly the file on disk right now, not
+    whatever was on disk the last time someone happened to run the build."""
+    sys.path.insert(0, "scripts")
+    import build_cloudshell_script as b
+
+    out = tmp_path / "deploy-e2e-bytecheck.sh"
+    subprocess.run([sys.executable, "scripts/build_cloudshell_script.py",
+                    "--out", str(out)], check=True, timeout=120)
+    text = out.read_text(encoding="utf-8")
+
+    embedded = b.extract_embedded(text, "AGENT_ORCHESTRATOR_PY_EOF")
+    on_disk = pathlib.Path("src/agent_orchestrator.py").read_text(encoding="utf-8")
+    if not on_disk.endswith("\n"):
+        on_disk += "\n"
+    assert embedded == on_disk
+
+
+def test_deploy_script_ships_the_corrected_codeconfiguration_artifact_shape():
+    """Narrow but load-bearing: this exact payload shape has now cost two
+    live CloudShell runs (once as the original bug, once as a stale
+    generated file that pre-dated the fix). Assert the SHIPPED, regenerated
+    script - not just the source module - carries the fix and not the old
+    broken shape."""
+    sys.path.insert(0, "scripts")
+    import build_cloudshell_script as b
+
+    out_path = b.default_output_path()
+    assert out_path.exists(), f"{out_path} has not been generated - run the build first"
+    text = out_path.read_text(encoding="utf-8")
+    assert "'codeConfiguration'" in text
+    assert "'bucket':   config.POLICY_BUCKET" not in text, \
+        "the old top-level agentRuntimeArtifact={'bucket', 'prefix', 'runtime'} shape is back"
 
 
 def test_template_refuses_to_run_directly():

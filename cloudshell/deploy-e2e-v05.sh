@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v03.sh              deploy everything, then grade it
-#     bash deploy-e2e-v03.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v03.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v03.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v03.sh --teardown   delete everything it created
+#     bash deploy-e2e-v05.sh              deploy everything, then grade it
+#     bash deploy-e2e-v05.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v05.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v05.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v05.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v03.sh --teardown
+#     bash deploy-e2e-v05.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -38,17 +38,23 @@
 #  outright. Every later phase runs project code through that venv's python3.
 #  ─────────────────────────────────────────────────────────────────────────
 #
-#  HONESTY NOTE — read this too
+#  STATUS — read this too
 #
-#  This script was written and syntax-checked (`bash -n`), but it has NOT
-#  been executed against a live AWS account: no AWS credentials were
-#  available on the machine that wrote it, and the Udacity Cloud Lab had
-#  not been launched. Every AWS-mutating call below is therefore treated as
-#  fallible — a failure prints the exact console steps for that one piece
-#  and the script carries on with the rest, rather than claiming success it
-#  cannot verify. Check the summary table at the end of the run for what
-#  actually succeeded. This note is removed only once a live run exists as
-#  evidence (evidence/run-02 or later).
+#  This script HAS now been executed against a live AWS account. It deployed
+#  the CloudFormation stack, seeded the tables, provisioned the S3 Vectors
+#  bucket and three indexes, created and synced three Knowledge Bases,
+#  deployed the AgentCore runtime with the guardrail attached, and scored
+#  120/120 on the Udacity grader. That run is committed as evidence/run-02.
+#
+#  What is still NOT verified live:
+#    - --teardown (the cleanup ownership fix landed after the live run)
+#    - the adversarial suite's live verdicts, which returned errors because
+#      the account lacked Bedrock model access for the configured models
+#
+#  Every AWS-mutating call is still treated as fallible — a failure prints
+#  the exact console steps for that one piece and the script carries on,
+#  rather than claiming success it cannot verify. The summary table at the
+#  end of the run is the authority on what actually happened.
 #
 #  Resumable. State lives in ~/.novamart-state; re-running skips whatever
 #  already exists, so a dropped CloudShell session costs nothing but time.
@@ -68,7 +74,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v03.sh
+    bash cloudshell/deploy-e2e-v05.sh
 
 REFUSE
   exit 2
@@ -78,7 +84,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v03"
+SCRIPT_VERSION="v05"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -154,11 +160,13 @@ banner() {
   printf '%s\n' "${BOLD}NovaMart Multi-Agent Customer Support — end-to-end deploy ${SCRIPT_VERSION}${RESET}"
   printf '%s\n' "${DIM}running: ${BASH_SOURCE[0]}${RESET}"
   printf '%s\n' "${DIM}region $REGION · project $PROJECT_NAME · state $STATE_DIR${RESET}"
-  printf '\n%s%s%s\n' "$YELLOW" "HONESTY NOTE" "$RESET"
-  printf '%s\n' "${DIM}This script is syntax-checked but has NOT been executed against a live${RESET}"
-  printf '%s\n' "${DIM}AWS account. Every AWS call below is treated as fallible: a failure prints${RESET}"
-  printf '%s\n' "${DIM}console steps for that one piece and the run continues. See the summary${RESET}"
-  printf '%s\n' "${DIM}table at the end for what actually succeeded.${RESET}"
+  printf '\n%s%s%s\n' "$YELLOW" "STATUS" "$RESET"
+  printf '%s\n' "${DIM}This script HAS been run against a live AWS account: it deployed the full${RESET}"
+  printf '%s\n' "${DIM}stack and scored 120/120 on the Udacity grader (evidence/run-02).${RESET}"
+  printf '%s\n' "${DIM}Not yet exercised live: --teardown, and the adversarial suite's live${RESET}"
+  printf '%s\n' "${DIM}verdicts (they need Bedrock model access for the configured models).${RESET}"
+  printf '%s\n' "${DIM}Every AWS call is still treated as fallible: a failure prints console steps${RESET}"
+  printf '%s\n' "${DIM}for that one piece and the run continues. Trust the summary table below.${RESET}"
   printf '\n%s%s%s\n' "$YELLOW" "COST WARNING" "$RESET"
   printf '%s\n' "${DIM}Bedrock Knowledge Base storage and its S3 Vectors index bill while idle,${RESET}"
   printf '%s\n' "${DIM}whether or not anything queries them. Run --teardown after screenshotting.${RESET}"
@@ -4900,11 +4908,40 @@ _ORDER = [
 ]
 
 
+_KB_NAME_RE = re.compile(r"^novamart-[A-Za-z0-9]+-policy-kb$")
+
+
 def _owned(name: str) -> bool:
-    """Only ever touch resources this project named."""
-    if config is None:
+    """Only ever touch resources this project named.
+
+    Three different naming conventions show up across the resources this
+    project actually creates, and a live run proved that recognising only
+    one of them makes teardown silently skip real, billing resources while
+    still reporting success:
+
+      - "{PROJECT_NAME}-..." (hyphenated) - the CloudFormation stack, the
+        policy/vector S3 buckets, the guardrail (config.GUARDRAIL_NAME).
+      - "{PROJECT_NAME with '-' -> '_'}_..." - the AgentCore Runtime and
+        Memory names, which agent_orchestrator.py builds with
+        f"{config.PROJECT_NAME}-runtime".replace('-', '_') /
+        f"{config.PROJECT_NAME}-memory".replace('-', '_'). With the
+        default PROJECT_NAME these are literally
+        "udacity_agentcore_runtime" and "udacity_agentcore_memory" - proven
+        live, and neither starts with "udacity-agentcore".
+      - "novamart-<domain>-policy-kb" - the three Knowledge Bases
+        (cloudshell/_deploy-e2e.template.sh's create_kb), named directly
+        and independently of PROJECT_NAME. Proven live as
+        "novamart-returns-policy-kb", "novamart-shipping-policy-kb" and
+        "novamart-warranty-policy-kb".
+    """
+    if config is None or not name:
         return False
-    return bool(name) and name.startswith(config.PROJECT_NAME)
+    underscored = config.PROJECT_NAME.replace('-', '_')
+    return (
+        name.startswith(config.PROJECT_NAME)
+        or name.startswith(underscored)
+        or bool(_KB_NAME_RE.match(name))
+    )
 
 
 def plan() -> list[dict]:
@@ -5083,6 +5120,35 @@ def _delete(step: dict) -> None:
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 CLEANUP_PY_EOF
+
+  mkdir -p "$(dirname "$PROJECT_DIR/scripts/_pathutil.py")"
+  cat > "$PROJECT_DIR/scripts/_pathutil.py" <<'PATHUTIL_PY_EOF'
+"""Shared helper for scripts/ entry points that import agent_orchestrator
+directly against a live deployment.
+
+Both run_adversarial.py's run_live() and run_scenarios.py's run_live() do
+`import config` (satisfied by inserting the repo ROOT onto sys.path, which
+both already did) followed by `import agent_orchestrator` (which lives in
+src/, a directory ROOT does not cover). That second import was missing its
+own sys.path entry in both scripts, independently, and cost two separate
+live CloudShell runs the identical `ModuleNotFoundError: No module named
+'agent_orchestrator'` before either was noticed. Extracted here once so the
+fix cannot drift back out of sync between the two call sites - or apply to
+only one of them again if a third script needs it later.
+"""
+from __future__ import annotations
+
+import pathlib
+import sys
+
+
+def ensure_src_on_path(root: pathlib.Path) -> None:
+    """Insert <root>/src onto sys.path, once, so `import agent_orchestrator`
+    (and anything else that lives in src/) resolves."""
+    src_dir = root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+PATHUTIL_PY_EOF
 
   mkdir -p "$(dirname "$PROJECT_DIR/scripts/run_adversarial.py")"
   cat > "$PROJECT_DIR/scripts/run_adversarial.py" <<'RUN_ADVERSARIAL_PY_EOF'
@@ -5309,9 +5375,8 @@ def run_live(runtime_arn: str) -> list[dict]:
     actually came back. Only meaningful with real AWS credentials and a
     real runtime_arn - this is the one mode that can observe enforcement.
     """
-    src_dir = ROOT / "src"
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
+    from _pathutil import ensure_src_on_path
+    ensure_src_on_path(ROOT)
 
     import config
     import agent_orchestrator
@@ -5415,12 +5480,22 @@ def _write_evidence(mode: str, report: list[dict], out_dir: pathlib.Path) -> Non
             "recorded what actually came back. This is enforcement evidence, not "
             "a configuration check.",
             "",
-            "| kind | prompt | expected | verdict |",
-            "|---|---|---|---|",
+            "| kind | prompt | expected | verdict | error |",
+            "|---|---|---|---|---|",
         ]
         for e in report:
+            # A bare "error" verdict with nothing else is not diagnosable
+            # from this table alone - the exception is already in the
+            # per-case .txt transcript, but it belongs here too so a future
+            # run can tell "the model call failed, and here is why" apart
+            # from "the model responded but the classifier didn't recognise
+            # it" without opening every file.
+            error_cell = (e.get("error", "") or "-").replace("|", "\\|").replace("\n", " ")
+            if len(error_cell) > 120:
+                error_cell = error_cell[:117] + "..."
             index_lines.append(
-                f"| {e['kind']}{_marker(e)} | {e['prompt']} | {e['expect']} | {e['verdict']} |"
+                f"| {e['kind']}{_marker(e)} | {e['prompt']} | {e['expect']} | "
+                f"{e['verdict']} | {error_cell} |"
             )
 
     if footnotes:
@@ -5738,6 +5813,9 @@ def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
 def run_live(xray_wait: int, xray_poll_interval: int) -> list[dict]:
     """Send each scenario through the deployed runtime via invoke_agent()
     (pre-written, unmodified), then look up its X-Ray trace by time window."""
+    from _pathutil import ensure_src_on_path
+    ensure_src_on_path(ROOT)
+
     import config
     import agent_orchestrator
 
@@ -5923,6 +6001,7 @@ RUN_SCENARIOS_PY_EOF
   ok "infrastructure/starter_stack.yaml"
   ok "infrastructure/seed_data.py"
   ok "infrastructure/cleanup.py"
+  ok "scripts/_pathutil.py"
   ok "scripts/run_adversarial.py"
   ok "scripts/run_scenarios.py"
   record "Project files" "OK" "$PROJECT_DIR"
@@ -6541,8 +6620,17 @@ run_grader() {
   # print_score() in test_agent.py always exits 0 on a real run (it never
   # calls sys.exit on a partial score), so a clean exit code alone does not
   # mean the grade was good — the actual "Score: X/Y" line is what to trust.
+  #
+  # test_agent.py wraps that line in ANSI colour codes (Colors.BOLD before
+  # "Score:" and a colour code between "Score: " and the digits), so the
+  # digits are never actually adjacent to the literal text "Score: " in the
+  # raw bytes - a plain grep on the file as captured misses every run,
+  # including a perfect one, and the summary below would print PARTIAL/"no
+  # score line found" right next to a genuine 120/120. Strip ANSI escapes
+  # before matching.
   local score_line
-  score_line="$(grep -oE 'Score: [0-9]+/[0-9]+ pts \([0-9]+%\)' "${EVIDENCE_DIR}/pytest_output.txt" 2>/dev/null | tail -1)"
+  score_line="$(sed -r 's/\x1B\[[0-9;]*[mK]//g' "${EVIDENCE_DIR}/pytest_output.txt" 2>/dev/null \
+    | grep -oE 'Score: [0-9]+/[0-9]+ pts \([0-9]+%\)' | tail -1)"
 
   if [[ $rc -ne 0 ]]; then
     bad "grader crashed (exit $rc) — see ${EVIDENCE_DIR}/pytest_output.txt"
@@ -6653,14 +6741,26 @@ package_submission() {
   cp -r "$PROJECT_DIR/infrastructure" "$staging/" 2>/dev/null
   cp -r "$PROJECT_DIR/src" "$staging/src_full" 2>/dev/null
 
-  # ── .env, every value redacted, key names kept ─────────────────────────────
+  # ── .env — populated, with only true credentials redacted ──────────────────
+  # The project brief asks for "the populated .env", and the rubric checks
+  # that it "contains valid, non-empty values for RETURNS_KB_ID,
+  # SHIPPING_KB_ID, and WARRANTY_KB_ID". Blanket redaction fails that outright.
+  # The values this file holds are resource identifiers, not secrets: KB ids,
+  # a runtime ARN, a guardrail id. Those ship as-is. Anything credential-shaped
+  # is redacted, so a stray access key pasted into .env never reaches the zip.
   if [[ -f "$ENV_FILE" ]]; then
-    # Only lines that actually assign a key (KEY=value) are touched, so
-    # comments and blank lines in .env stay readable in the submission.
-    sed -E '/^[A-Za-z_][A-Za-z0-9_]*=/ s/=.*/=REDACTED/' "$ENV_FILE" > "$staging/.env"
-    ok ".env (redacted)"
+    sed -E '/^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)=/ s/=.*/=REDACTED/;
+            /^[A-Za-z_][A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)[A-Za-z0-9_]*=/ s/=.*/=REDACTED/' \
+        "$ENV_FILE" > "$staging/.env"
+    local kb_ids
+    kb_ids="$(grep -cE '^(RETURNS|SHIPPING|WARRANTY)_KB_ID=.+' "$staging/.env" 2>/dev/null || echo 0)"
+    if [[ "$kb_ids" -eq 3 ]]; then
+      ok ".env (populated — 3 KB ids present, credentials redacted)"
+    else
+      warn ".env packaged but only ${kb_ids}/3 KB ids are populated — the rubric checks these"
+    fi
   else
-    warn "no .env found at $ENV_FILE — nothing to redact"
+    warn "no .env found at $ENV_FILE — the submission needs the populated .env"
   fi
 
   # ── screenshots — captured locally, not by this script ─────────────────────
@@ -6716,7 +6816,7 @@ package_submission() {
       printf '| src/agent_orchestrator.py | MISSING |\n'
     fi
     if [[ -f "$staging/.env" ]]; then
-      printf '| .env (redacted) | present — every value replaced with REDACTED, key names kept |\n'
+      printf '| .env (populated) | KB ids, runtime ARN and guardrail id intact; credential-shaped keys redacted |\n'
     else
       printf '| .env (redacted) | MISSING |\n'
     fi
@@ -6824,6 +6924,17 @@ teardown() {
     return 1
   fi
 
+  # Re-resolve PROJECT_NAME from the embedded config.py, exactly like every
+  # other phase does via materialise(). Skipping this left PROJECT_NAME set
+  # to the empty string (from main()'s placeholder), and config.py's
+  # os.environ.get('PROJECT_NAME', 'udacity-agentcore') treats an exported-
+  # but-empty env var as a real value rather than falling back - so
+  # _owned() matched every resource in the account (fail-"safe" only by
+  # accident) while _guard_account() called describe-stacks with an empty
+  # stack name and sys.exit(3)'d before anything was deleted. materialise()
+  # also re-writes the project files, which is cheap and idempotent.
+  materialise
+
   # cleanup.py does `import config`, which unconditionally does
   # `from dotenv import load_dotenv` — it needs the same venv every other
   # phase does. install_dependencies() is cheap to re-run: it no-ops
@@ -6835,15 +6946,28 @@ teardown() {
       "$PY" infrastructure/cleanup.py --yes )
   local rc=$?
 
-  rm -rf "$STATE_DIR" "$PROJECT_DIR"
-  printf '\n%sLocal state removed:%s %s, %s\n' "$GREEN" "$RESET" "$STATE_DIR" "$PROJECT_DIR"
+  # Preserve the evidence this project produced BEFORE anything is removed.
+  # Every doc here tells the user to screenshot/package evidence/live and
+  # then immediately tear down to stop the billing meter - deleting
+  # PROJECT_DIR must not also delete the proof of what ran.
+  if [[ -d "$EVIDENCE_DIR" ]] && [[ -n "$(ls -A "$EVIDENCE_DIR" 2>/dev/null)" ]]; then
+    local archive="${HOME}/novamart-evidence-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$archive"
+    cp -r "$EVIDENCE_DIR"/. "$archive"/ 2>/dev/null \
+      && printf '%sEvidence preserved:%s %s\n' "$GREEN" "$RESET" "$archive" \
+      || warn "could not copy evidence out of $EVIDENCE_DIR before teardown"
+  fi
 
   if [[ $rc -eq 0 ]]; then
+    rm -rf "$STATE_DIR" "$PROJECT_DIR"
+    printf '\n%sLocal state removed:%s %s, %s\n' "$GREEN" "$RESET" "$STATE_DIR" "$PROJECT_DIR"
     printf '%sDone.%s Verify in the console that the Knowledge Bases and S3 Vectors bucket\n' "$GREEN" "$RESET"
     printf 'are gone — those are what bill while idle.\n\n'
   else
     printf '%scleanup.py reported at least one failure — check its summary above and\n' "$YELLOW"
-    printf 'finish any remaining deletions in the AWS console.%s\n\n' "$RESET"
+    printf 'finish any remaining deletions in the AWS console.%s\n' "$RESET"
+    printf 'Local state was left in place at %s and %s so you can retry:\n' "$STATE_DIR" "$PROJECT_DIR"
+    printf '  bash %s --teardown\n\n' "${BASH_SOURCE[0]}"
   fi
 }
 

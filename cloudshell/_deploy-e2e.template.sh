@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v03.sh              deploy everything, then grade it
-#     bash deploy-e2e-v03.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v03.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v03.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v03.sh --teardown   delete everything it created
+#     bash deploy-e2e-v05.sh              deploy everything, then grade it
+#     bash deploy-e2e-v05.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v05.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v05.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v05.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v03.sh --teardown
+#     bash deploy-e2e-v05.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -38,17 +38,23 @@
 #  outright. Every later phase runs project code through that venv's python3.
 #  ─────────────────────────────────────────────────────────────────────────
 #
-#  HONESTY NOTE — read this too
+#  STATUS — read this too
 #
-#  This script was written and syntax-checked (`bash -n`), but it has NOT
-#  been executed against a live AWS account: no AWS credentials were
-#  available on the machine that wrote it, and the Udacity Cloud Lab had
-#  not been launched. Every AWS-mutating call below is therefore treated as
-#  fallible — a failure prints the exact console steps for that one piece
-#  and the script carries on with the rest, rather than claiming success it
-#  cannot verify. Check the summary table at the end of the run for what
-#  actually succeeded. This note is removed only once a live run exists as
-#  evidence (evidence/run-02 or later).
+#  This script HAS now been executed against a live AWS account. It deployed
+#  the CloudFormation stack, seeded the tables, provisioned the S3 Vectors
+#  bucket and three indexes, created and synced three Knowledge Bases,
+#  deployed the AgentCore runtime with the guardrail attached, and scored
+#  120/120 on the Udacity grader. That run is committed as evidence/run-02.
+#
+#  What is still NOT verified live:
+#    - --teardown (the cleanup ownership fix landed after the live run)
+#    - the adversarial suite's live verdicts, which returned errors because
+#      the account lacked Bedrock model access for the configured models
+#
+#  Every AWS-mutating call is still treated as fallible — a failure prints
+#  the exact console steps for that one piece and the script carries on,
+#  rather than claiming success it cannot verify. The summary table at the
+#  end of the run is the authority on what actually happened.
 #
 #  Resumable. State lives in ~/.novamart-state; re-running skips whatever
 #  already exists, so a dropped CloudShell session costs nothing but time.
@@ -68,7 +74,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v03.sh
+    bash cloudshell/deploy-e2e-v05.sh
 
 REFUSE
   exit 2
@@ -78,7 +84,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v03"
+SCRIPT_VERSION="v05"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -154,11 +160,13 @@ banner() {
   printf '%s\n' "${BOLD}NovaMart Multi-Agent Customer Support — end-to-end deploy ${SCRIPT_VERSION}${RESET}"
   printf '%s\n' "${DIM}running: ${BASH_SOURCE[0]}${RESET}"
   printf '%s\n' "${DIM}region $REGION · project $PROJECT_NAME · state $STATE_DIR${RESET}"
-  printf '\n%s%s%s\n' "$YELLOW" "HONESTY NOTE" "$RESET"
-  printf '%s\n' "${DIM}This script is syntax-checked but has NOT been executed against a live${RESET}"
-  printf '%s\n' "${DIM}AWS account. Every AWS call below is treated as fallible: a failure prints${RESET}"
-  printf '%s\n' "${DIM}console steps for that one piece and the run continues. See the summary${RESET}"
-  printf '%s\n' "${DIM}table at the end for what actually succeeded.${RESET}"
+  printf '\n%s%s%s\n' "$YELLOW" "STATUS" "$RESET"
+  printf '%s\n' "${DIM}This script HAS been run against a live AWS account: it deployed the full${RESET}"
+  printf '%s\n' "${DIM}stack and scored 120/120 on the Udacity grader (evidence/run-02).${RESET}"
+  printf '%s\n' "${DIM}Not yet exercised live: --teardown, and the adversarial suite's live${RESET}"
+  printf '%s\n' "${DIM}verdicts (they need Bedrock model access for the configured models).${RESET}"
+  printf '%s\n' "${DIM}Every AWS call is still treated as fallible: a failure prints console steps${RESET}"
+  printf '%s\n' "${DIM}for that one piece and the run continues. Trust the summary table below.${RESET}"
   printf '\n%s%s%s\n' "$YELLOW" "COST WARNING" "$RESET"
   printf '%s\n' "${DIM}Bedrock Knowledge Base storage and its S3 Vectors index bill while idle,${RESET}"
   printf '%s\n' "${DIM}whether or not anything queries them. Run --teardown after screenshotting.${RESET}"
@@ -185,6 +193,7 @@ __EMBEDDED_FILES__
   ok "infrastructure/starter_stack.yaml"
   ok "infrastructure/seed_data.py"
   ok "infrastructure/cleanup.py"
+  ok "scripts/_pathutil.py"
   ok "scripts/run_adversarial.py"
   ok "scripts/run_scenarios.py"
   record "Project files" "OK" "$PROJECT_DIR"
@@ -924,14 +933,26 @@ package_submission() {
   cp -r "$PROJECT_DIR/infrastructure" "$staging/" 2>/dev/null
   cp -r "$PROJECT_DIR/src" "$staging/src_full" 2>/dev/null
 
-  # ── .env, every value redacted, key names kept ─────────────────────────────
+  # ── .env — populated, with only true credentials redacted ──────────────────
+  # The project brief asks for "the populated .env", and the rubric checks
+  # that it "contains valid, non-empty values for RETURNS_KB_ID,
+  # SHIPPING_KB_ID, and WARRANTY_KB_ID". Blanket redaction fails that outright.
+  # The values this file holds are resource identifiers, not secrets: KB ids,
+  # a runtime ARN, a guardrail id. Those ship as-is. Anything credential-shaped
+  # is redacted, so a stray access key pasted into .env never reaches the zip.
   if [[ -f "$ENV_FILE" ]]; then
-    # Only lines that actually assign a key (KEY=value) are touched, so
-    # comments and blank lines in .env stay readable in the submission.
-    sed -E '/^[A-Za-z_][A-Za-z0-9_]*=/ s/=.*/=REDACTED/' "$ENV_FILE" > "$staging/.env"
-    ok ".env (redacted)"
+    sed -E '/^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)=/ s/=.*/=REDACTED/;
+            /^[A-Za-z_][A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)[A-Za-z0-9_]*=/ s/=.*/=REDACTED/' \
+        "$ENV_FILE" > "$staging/.env"
+    local kb_ids
+    kb_ids="$(grep -cE '^(RETURNS|SHIPPING|WARRANTY)_KB_ID=.+' "$staging/.env" 2>/dev/null || echo 0)"
+    if [[ "$kb_ids" -eq 3 ]]; then
+      ok ".env (populated — 3 KB ids present, credentials redacted)"
+    else
+      warn ".env packaged but only ${kb_ids}/3 KB ids are populated — the rubric checks these"
+    fi
   else
-    warn "no .env found at $ENV_FILE — nothing to redact"
+    warn "no .env found at $ENV_FILE — the submission needs the populated .env"
   fi
 
   # ── screenshots — captured locally, not by this script ─────────────────────
@@ -987,7 +1008,7 @@ package_submission() {
       printf '| src/agent_orchestrator.py | MISSING |\n'
     fi
     if [[ -f "$staging/.env" ]]; then
-      printf '| .env (redacted) | present — every value replaced with REDACTED, key names kept |\n'
+      printf '| .env (populated) | KB ids, runtime ARN and guardrail id intact; credential-shaped keys redacted |\n'
     else
       printf '| .env (redacted) | MISSING |\n'
     fi
