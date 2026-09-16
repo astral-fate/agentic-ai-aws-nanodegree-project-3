@@ -653,16 +653,18 @@ def build_policy_agent() -> Agent:
         """
 
         @tool
-        def search_policy(query: str) -> list[dict]:
+        def search_policy(query: str) -> str:
             """Retrieve the most relevant passages from this agent's Knowledge Base.
 
             Args:
                 query: The natural-language policy question.
 
             Returns:
-                A list of dicts, each with 'text', 'source' and 'score'.
+                A human-readable string with each passage's score, text and
+                source (see format_kb_results), or a message stating that no
+                relevant documents were found.
             """
-            return retrieve_from_knowledge_base(kb_id, query, top_k=3)
+            return format_kb_results(retrieve_from_knowledge_base(kb_id, query, top_k=3))
 
         search_policy.__name__ = f'search_{domain}_policy'
 

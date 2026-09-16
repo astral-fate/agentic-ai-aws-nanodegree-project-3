@@ -18,11 +18,33 @@ def test_coordinator_temperature_is_point_two(policy):
 
 
 def test_returns_results_from_all_three_knowledge_bases(policy):
+    """Each domain's result must contain content unique to its own fixture -
+    not merely be non-empty, which an error string or a refusal message
+    would also satisfy against the live SDK."""
     out = policy.tool_registry.registry["search_all_policies"](
         query="What is the return policy for premium customers?")
     assert set(out["results"]) == {"returns", "shipping", "warranty"}
-    for domain, rows in out["results"].items():
-        assert rows, f"{domain} returned nothing"
+    assert "30 days of delivery" in out["results"]["returns"]
+    assert "two-day shipping" in out["results"]["shipping"]
+    assert "12-month limited warranty" in out["results"]["warranty"]
+
+
+def test_search_all_policies_actually_invokes_each_retriever_agent(orchestrator, policy):
+    """Guards against silently reinstating the pre-fix bypass, where
+    search_all_policies called retrieve_from_knowledge_base directly instead
+    of invoking the retriever sub-agents. harness/scripted_model.py records
+    every (agent_name, tool_name) call it dispatches, so if the retriever
+    agents are never called, none of their names show up here."""
+    from harness import scripted_model
+
+    scripted_model.reset_calls()
+    policy.tool_registry.registry["search_all_policies"](query="returns")
+    called_agents = {agent_name for agent_name, _tool_name in scripted_model.calls}
+    assert called_agents == {
+        "ReturnsPolicyRetrieverAgent",
+        "ShippingPolicyRetrieverAgent",
+        "WarrantyPolicyRetrieverAgent",
+    }
 
 
 def test_retrievals_actually_overlap_in_time(orchestrator, policy, monkeypatch):
