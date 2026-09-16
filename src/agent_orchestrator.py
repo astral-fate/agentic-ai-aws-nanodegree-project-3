@@ -1623,6 +1623,78 @@ def deploy_all():
     return runtime_arn, guardrail_id
 
 
+# ═══════════════════════════════════════════════════════
+#  HTTP ENTRY POINT (Task 11 - AgentCore Runtime starts this in-container)
+# ═══════════════════════════════════════════════════════
+
+def _serve_http() -> None:
+    """Serve the orchestrator over HTTP for AgentCore Runtime.
+
+    deploy_to_agentcore_runtime() ships this file as the runtime artifact
+    and starts it inside the container with the resource ids config.py
+    needs (KB ids, guardrail id, etc.) injected as environment variables -
+    see the environmentVariables passed to create_agent_runtime() above.
+    So this function rebuilds the five-agent graph in-process exactly like
+    'test'/'chat' do, then serves POST /invocations. Standard library only:
+    whatever the packaging step zipped is the only dependency set the
+    container has.
+    """
+    import http.server
+
+    print("  Building agent graph...")
+    inventory_agent     = build_inventory_agent()
+    refund_agent        = build_refund_agent()
+    policy_agent        = build_policy_agent()
+    communication_agent = build_communication_agent()
+    orchestrator = build_orchestrator_agent(
+        inventory_agent, refund_agent, policy_agent, communication_agent
+    )
+    print("  All 5 agents ready.")
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def _reply(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload).encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == '/ping':
+                self._reply(200, {"status": "healthy"})
+            else:
+                self._reply(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != '/invocations':
+                self._reply(404, {"error": "not found"})
+                return
+            try:
+                length  = int(self.headers.get('Content-Length', 0) or 0)
+                raw     = self.rfile.read(length) if length else b'{}'
+                payload = json.loads(raw or b'{}')
+
+                session_id  = payload.get('session_id') or f"s-{uuid.uuid4().hex[:8]}"
+                customer_id = payload.get('customer_id', 'CUST-001')
+                prompt      = payload.get('prompt', '')
+
+                enriched_prompt = (f"[Session ID: {session_id}] "
+                                    f"[Customer ID: {customer_id}] {prompt}")
+                response = orchestrator(enriched_prompt)
+                self._reply(200, {"response": str(response)})
+            except Exception as exc:
+                self._reply(500, {"error": str(exc)})
+
+        def log_message(self, fmt, *args):
+            pass  # keep AgentCore Runtime's own request log clean
+
+    port   = int(os.environ.get('PORT', '8080'))
+    server = http.server.HTTPServer(('0.0.0.0', port), _Handler)
+    print(f"  Listening on 0.0.0.0:{port}  (POST /invocations, GET /ping)")
+    server.serve_forever()
+
+
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'deploy':
         deploy_all()
@@ -1757,8 +1829,24 @@ if __name__ == '__main__':
             print(f"  {_C.GRY}{'=' * W}{_C.RESET}")
             print()
 
+    elif len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        # AgentCore Runtime starts this file and speaks HTTP to it. Rebuild the
+        # agent graph in-process; config reads its IDs from the runtime's
+        # environment variables, which deploy_to_agentcore_runtime set.
+        _serve_http()
+
+    elif len(sys.argv) > 1 and sys.argv[1] == 'invoke':
+        message = sys.argv[2] if len(sys.argv) > 2 else ''
+        if not message:
+            print('usage: agent_orchestrator.py invoke "<message>"')
+            sys.exit(2)
+        session_id = f"s-{uuid.uuid4().hex[:8]}"
+        print(invoke_agent(session_id, 'CUST-001', message))
+
     else:
         print("Usage:")
-        print("  python agent_orchestrator.py deploy  # Deploy to AgentCore")
-        print("  python agent_orchestrator.py test    # Run automated test cases")
-        print("  python agent_orchestrator.py chat    # Interactive terminal chat")
+        print("  python agent_orchestrator.py deploy       # Deploy to AgentCore")
+        print("  python agent_orchestrator.py test         # Run automated test cases")
+        print("  python agent_orchestrator.py chat         # Interactive terminal chat")
+        print("  python agent_orchestrator.py serve        # Serve HTTP for AgentCore Runtime")
+        print("  python agent_orchestrator.py invoke \"<message>\"  # Invoke the deployed runtime")
