@@ -635,19 +635,147 @@ def build_policy_agent() -> Agent:
         temperature=0.0,
     )
 
-    # TODO: Build ReturnsPolicyRetrieverAgent
+    def _make_retriever(agent_name: str, domain: str, kb_id: str, description: str) -> Agent:
+        """Build one retriever sub-agent bound to a single Knowledge Base.
 
-    # TODO: Build ShippingPolicyRetrieverAgent
+        Args:
+            agent_name:  Display name for the sub-agent, e.g.
+                         "ReturnsPolicyRetrieverAgent".
+            domain:      Short internal key for this domain, e.g. "returns".
+            kb_id:       The Bedrock Knowledge Base ID this retriever - and only
+                         this retriever - is allowed to query.
+            description: Human-readable description of the KB's contents, used
+                         in the sub-agent's system prompt.
 
-    # TODO: Build WarrantyPolicyRetrieverAgent
+        Returns:
+            A Strands Agent configured with exactly one tool that retrieves
+            from `kb_id`.
+        """
 
-    # TODO: Implement search_all_policies - parallel RAG retrieval tool
+        @tool
+        def search_policy(query: str) -> list[dict]:
+            """Retrieve the most relevant passages from this agent's Knowledge Base.
 
-    # TODO: Create a BedrockModel for the PolicyAgent coordinator
+            Args:
+                query: The natural-language policy question.
 
-    # TODO: System prompt for PolicyAgent coordinator
+            Returns:
+                A list of dicts, each with 'text', 'source' and 'score'.
+            """
+            return retrieve_from_knowledge_base(kb_id, query, top_k=3)
 
-    # TODO: Instantiate and return the PolicyAgent coordinator
+        search_policy.__name__ = f'search_{domain}_policy'
+
+        return Agent(
+            model=retriever_model,
+            system_prompt=(
+                f"You are the {agent_name}. You retrieve {description} and "
+                f"nothing else. Call your search tool, then report the "
+                f"retrieved passages verbatim. Never answer from memory and "
+                f"never speculate beyond what the passages say."
+            ),
+            tools=[search_policy],
+            name=agent_name,
+        )
+
+    # ReturnsPolicyRetrieverAgent, ShippingPolicyRetrieverAgent and
+    # WarrantyPolicyRetrieverAgent - one tool each, one Knowledge Base each.
+    returns_retriever = _make_retriever(
+        'ReturnsPolicyRetrieverAgent', 'returns', config.RETURNS_KB_ID,
+        'NovaMart return and refund policy passages')
+    shipping_retriever = _make_retriever(
+        'ShippingPolicyRetrieverAgent', 'shipping', config.SHIPPING_KB_ID,
+        'NovaMart shipping policy passages')
+    warranty_retriever = _make_retriever(
+        'WarrantyPolicyRetrieverAgent', 'warranty', config.WARRANTY_KB_ID,
+        'NovaMart warranty policy passages')
+
+    # domain -> (retriever sub-agent, its Knowledge Base id). The retriever
+    # sub-agents themselves are never registered as tools on the coordinator -
+    # only search_all_policies is - so the coordinator's tool_registry stays
+    # at exactly one entry.
+    _RETRIEVERS = {
+        'returns':  (returns_retriever,  config.RETURNS_KB_ID),
+        'shipping': (shipping_retriever, config.SHIPPING_KB_ID),
+        'warranty': (warranty_retriever, config.WARRANTY_KB_ID),
+    }
+
+    # Display labels for the AgentTrace calls below (kb_start/kb_result key
+    # their formatting off these capitalized domain names).
+    _TRACE_LABELS = {'returns': 'Returns', 'shipping': 'Shipping', 'warranty': 'Warranty'}
+
+    @tool
+    def search_all_policies(query: str) -> dict:
+        """Search all three policy Knowledge Bases at once and collect the results.
+
+        Fans the query out to the Returns, Shipping and Warranty retriever
+        sub-agents simultaneously, so one slow Knowledge Base does not delay
+        the others. A single Knowledge Base failing does not lose the other
+        two - its error is recorded and the other results are still returned.
+
+        Args:
+            query: The customer's policy question.
+
+        Returns:
+            A dict with 'results' (a domain -> passages mapping covering all
+            three domains) and 'errors' (a domain -> message mapping, empty
+            when every retrieval succeeded).
+        """
+        results: dict = {}
+        errors: dict = {}
+
+        def _retrieve(domain: str, kb_id: str):
+            return domain, retrieve_from_knowledge_base(kb_id, query, top_k=3)
+
+        trace.kb_start({_TRACE_LABELS[d]: kb_id for d, (_a, kb_id) in _RETRIEVERS.items()})
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(_retrieve, domain, kb_id): domain
+                for domain, (_agent, kb_id) in _RETRIEVERS.items()
+            }
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    _, passages = future.result()
+                    results[domain] = passages
+                except Exception as exc:
+                    # One KB failing must not lose the other two.
+                    results[domain] = []
+                    errors[domain] = str(exc)
+
+        trace.kb_done(len(_RETRIEVERS))
+        for domain in _RETRIEVERS:
+            trace.kb_result(_TRACE_LABELS[domain], format_kb_results(results.get(domain, [])))
+
+        return {'results': results, 'errors': errors}
+
+    coordinator_model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.2,
+    )
+
+    return Agent(
+        model=coordinator_model,
+        system_prompt="""You are the PolicyAgent for NovaMart customer support.
+
+You answer questions about company policy - return windows, shipping rates,
+warranty terms - and you answer them ONLY from retrieved policy documents.
+
+Your process:
+1. ALWAYS call search_all_policies first. Every time, before answering.
+2. Read the passages it returns from all three policy domains.
+3. Synthesize a single grounded answer, and say which policy domain each
+   fact came from.
+
+You know policy text. You do NOT know anything about individual customers,
+their tier, or their orders. If asked about a specific customer's account,
+say that belongs to the inventory specialist.
+
+Never state a policy fact that is not in the retrieved passages.""",
+        tools=[search_all_policies],
+        name="PolicyAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
