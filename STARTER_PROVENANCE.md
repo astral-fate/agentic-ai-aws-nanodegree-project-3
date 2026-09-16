@@ -32,12 +32,12 @@ Placed byte-for-byte as found, hashed with SHA-256.
 
 | File | SHA-256 (prefix) | Corroboration |
 |---|---|---|
-| `config.py` | `b706429e382f113f…` | Taken from **B** — the only copy with the Claude 4.5 model IDs this spec requires. A's copy uses OpenAI `gpt-oss` model IDs instead (a workaround for that student's account being geo-blocked from Anthropic models) and was rejected for that reason. |
-| `tests/test_agent.py` | `0baa861676cc3a56…` | Taken from **A** — same length (540 lines) as B's copy in both repos, differing only in `test_2_7_routing_uses_different_models`: A's version accepts either the Claude model family *or* the `gpt-oss` family, which is the more permissive/portable check and does not hard-fail on the account-specific model substitution seen in A's `config.py`. B's version hard-requires Claude naming. Also differs from B in one comment (`-` vs `—`), which is cosmetic. |
+| `config.py` | `b706429e382f113f…` | Taken from **B** — the only copy with the Claude 4.5 model IDs this spec requires. A's copy uses OpenAI `gpt-oss` model IDs instead — the Udacity workspace ships two starter variants, and A's `tests/test_agent.py` accepts either model family while B's accepts Claude only. B matches the model table in the project brief, so B's `config.py` was taken and A's was rejected for that reason. |
+| `tests/test_agent.py` | `0baa861676cc3a56…` | Taken from **A** — same length (540 lines) as B's copy in both repos, differing only in `test_2_7_routing_uses_different_models`: A's version accepts either the Claude model family *or* the `gpt-oss` family, which is the more permissive/portable check and does not hard-fail on the different model IDs used in A's `config.py`. B's version hard-requires Claude naming. Also differs from B in one comment (`-` vs `—`), which is cosmetic. |
 | `infrastructure/seed_data.py` | `2e35fa075b1ce92b…` | Byte-for-byte identical in **A and B**. |
 | `infrastructure/starter_stack.yaml` | `2ad126d1c603e72b…` | Byte-for-byte identical in **A and B**. |
 | `src/agent_utils.py` | `7ab84a3293c04131…` | Byte-for-byte identical in **A and B**. |
-| `src/agent_observability.py` | `fb2f1a57c9498b11…` | See "§3.2 decision" below — taken from **A** only (723 lines); B's 148-line copy is a stripped-down variant that omits a symbol the orchestrator imports. |
+| `src/agent_observability.py` | `fb2f1a57c9498b11…` | See "§3.2 decision" below — taken from **A** only (723 lines); B's 148-line copy does not define a symbol the orchestrator imports. |
 | `src/bedrock_kb_retrieval.py` | `9e1852c1a4d3754d…` | Byte-for-byte identical in **A and B**. |
 | `src/demo.py` | `979f99c2190e1666…` | Byte-for-byte identical in **A and B**. |
 | `.env.example` | `acfa667e67198148…` | Taken from **A** (not required by the task-1 brief's hash table, included here anyway since it was placed from a reference repo). Contains no secrets — every value is either a placeholder or blank. |
