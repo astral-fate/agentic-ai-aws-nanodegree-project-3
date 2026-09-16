@@ -1256,6 +1256,38 @@ def configure_memory(runtime_arn: str) -> str:
     #   - memoryStrategies with summaryMemoryStrategy
     #   - clientToken for idempotency
 
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description=(
+            'Rolling session summary for the NovaMart support orchestrator, so '
+            'customers do not repeat themselves across turns.'
+        ),
+        eventExpiryDuration=7,
+        memoryStrategies=[
+            {
+                'summaryMemoryStrategy': {
+                    'name': 'SessionSummary',
+                    'namespaces': [config.MEMORY_NAMESPACE],
+                }
+            }
+        ],
+        clientToken=str(uuid.uuid4()),
+    )
+    memory = response['memory']
+    memory_arn = memory['memoryArn']
+
+    # Poll until memory reaches ACTIVE status
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        mem = agentcore_control.get_memory(memoryIdentifier=memory_arn)
+        if mem.get('memory', {}).get('status') == 'ACTIVE':
+            print(f"AgentCore Memory created: {memory_arn}")
+            return memory_arn
+        time.sleep(2)
+
+    raise TimeoutError(f"Memory {memory_arn} did not reach ACTIVE status within 60s")
+
+
 
 # ═══════════════════════════════════════════════════════
 #  TASK 6 - OBSERVABILITY
@@ -1278,6 +1310,23 @@ def configure_observability(runtime_arn: str) -> None:
     # runtime so the deployed agent logs and traces exactly as configured.
     # Wrap the call in try/except so a configuration error doesn't end the
     # deployment without context.
+
+    logging_configuration = {
+        'cloudWatchConfig': {
+            'logGroupName': config.AGENT_LOG_GROUP,
+            'logLevel': 'INFO',
+            'enabled': True,
+        },
+        'xRayConfig': {
+            'enabled': True,
+            'samplingRate': 1.0,
+        },
+    }
+
+    try:
+        apply_observability_config(runtime_arn, logging_configuration)
+    except Exception as exc:
+        logger.warning(f"Could not apply observability configuration: {exc}")
 
 
 # ═══════════════════════════════════════════════════════
