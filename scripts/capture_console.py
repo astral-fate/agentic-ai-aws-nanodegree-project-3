@@ -438,7 +438,32 @@ def build_targets(region: str, project_name: str) -> list[dict]:
     else:
         guardrail_note += " .env still shows DRAFT/blank -- verify a numbered version by hand."
 
-    return [
+    # Per-KB detail pages.
+    #
+    # The Knowledge Bases LIST view shows "Last sync date: -" and "Last sync: 0"
+    # even for a KB whose data source has genuinely synced, so a reviewer
+    # reading that column sees "never synced". The rubric asks specifically for
+    # the S3 Vectors backing store, its VectorStoreBucket and index, and the
+    # synced data source - all of which live on the individual KB page, not the
+    # list. These capture that, keyed off the ids in .env.
+    kb_targets = []
+    for domain in ("returns", "shipping", "warranty"):
+        kb_id = os.environ.get(f"{domain.upper()}_KB_ID", "").strip()
+        if not kb_id:
+            continue
+        kb_targets.append({
+            "name": f"07-kb-{domain}-detail",
+            "url": console(region,
+                           f"bedrock/home?region={region}#/knowledge-bases/knowledge-base/{kb_id}"),
+            "alt_urls": [console(region, f"bedrock/home?region={region}#/knowledge-bases")],
+            "note": (f"Bedrock -> Knowledge Bases -> novamart-{domain}-policy-kb: "
+                     f"Titan Embed Text v2, S3 Vectors backing store, "
+                     f"{domain}-policy-index, and the data source's sync status."),
+            "wait": 12000, "attempts": 14, "expect": domain,
+            "warm_url": console(region, f"bedrock/home?region={region}#/knowledge-bases"),
+        })
+
+    return kb_targets + [
         {
             "name": "03-knowledge-bases",
             "url": console(region, f"bedrock/home?region={region}#/knowledge-bases"),
