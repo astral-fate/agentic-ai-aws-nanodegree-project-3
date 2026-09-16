@@ -28,6 +28,16 @@
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
 #
+#  DEPENDENCIES — installed automatically, nothing to do by hand
+#
+#  CloudShell's python3 ships boto3 but not strands-agents or python-dotenv,
+#  both of which config.py and src/agent_orchestrator.py import unconditionally.
+#  Phase 1 below creates a dedicated virtualenv (~/.novamart-venv) and installs
+#  requirements.txt into it — not `pip install --user`, because CloudShell's
+#  own python3 is itself already inside a virtualenv where `--user` fails
+#  outright. Every later phase runs project code through that venv's python3.
+#  ─────────────────────────────────────────────────────────────────────────
+#
 #  HONESTY NOTE — read this too
 #
 #  This script was written and syntax-checked (`bash -n`), but it has NOT
@@ -76,6 +86,15 @@ PROJECT_DIR="${HOME}/novamart-project"
 STATE_DIR="${HOME}/.novamart-state"
 EVIDENCE_DIR="${PROJECT_DIR}/evidence/live"
 ENV_FILE="${PROJECT_DIR}/.env"
+
+# Every project-python invocation below goes through $PY, not the bare
+# `python3` on PATH. It starts as the system interpreter and is only
+# repointed at the venv once install_dependencies() has actually verified
+# the packages import there — so a script that never reaches that phase (or
+# whose venv creation fails) still runs seed_data.py, which needs nothing
+# beyond boto3, with whatever python3 CloudShell already provides.
+PY="python3"
+VENV_DIR="${HOME}/.novamart-venv"
 
 mkdir -p "$STATE_DIR"
 
@@ -178,7 +197,88 @@ __EMBEDDED_FILES__
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  1. Preflight
+#  1. Install Python dependencies
+# ═════════════════════════════════════════════════════════════════════════════
+# CloudShell's python3 ships boto3/botocore but not strands-agents or
+# python-dotenv — both are on the import path of the phases that actually
+# deploy and grade the agent: config.py does an unconditional
+# `from dotenv import load_dotenv`, and src/agent_orchestrator.py imports
+# `strands` / `strands.models`. Every script that reaches those imports
+# (agent_orchestrator.py, tests/test_agent.py, infrastructure/cleanup.py —
+# all three `import config`) needs this phase to have succeeded first.
+#
+# Installed into a dedicated venv rather than `pip install --user`:
+# CloudShell's own python3 is itself already inside a virtualenv, where user
+# site-packages are invisible to pip, so `--user` fails outright there. This
+# was learned the hard way in the sibling project's live run
+# (../agentic-ai-aws-nanodegree-project-2), which uses the same venv
+# approach for its own toolkit install.
+dependency_console_steps() {
+  cat <<EOF
+
+   ${BOLD}Install the dependencies by hand instead:${RESET}
+     python3 -m venv $VENV_DIR
+     $VENV_DIR/bin/pip install --upgrade pip
+     $VENV_DIR/bin/pip install -r $PROJECT_DIR/requirements.txt
+     Then re-run: bash ${BASH_SOURCE[0]}
+
+EOF
+}
+
+install_dependencies() {
+  phase "Installing Python dependencies (requirements.txt)"
+
+  if [[ -x "${VENV_DIR}/bin/python3" ]] \
+     && "${VENV_DIR}/bin/python3" -c "import strands, dotenv" >/dev/null 2>&1; then
+    PY="${VENV_DIR}/bin/python3"
+    skip "strands-agents and python-dotenv already importable in $VENV_DIR"
+    record "Dependencies" "OK" "already installed in $VENV_DIR"
+    return 0
+  fi
+
+  if [[ ! -x "${VENV_DIR}/bin/pip" ]]; then
+    printf '   %s⋯%s creating a virtualenv at %s ' "$DIM" "$RESET" "$VENV_DIR"
+    if python3 -m venv "$VENV_DIR" >/tmp/novamart-venv.log 2>&1; then
+      printf '%s✓%s\n' "$GREEN" "$RESET"
+    else
+      printf '%s✗%s\n' "$RED" "$RESET"
+      bad "could not create the virtualenv:"
+      tail -10 /tmp/novamart-venv.log | sed 's/^/       /'
+      dependency_console_steps
+      record "Dependencies" "FAILED" "could not create $VENV_DIR"
+      return 1
+    fi
+  fi
+
+  local out
+  if out="$( "${VENV_DIR}/bin/pip" install --quiet --upgrade pip 2>&1 \
+             && "${VENV_DIR}/bin/pip" install --quiet -r "$PROJECT_DIR/requirements.txt" 2>&1 )"; then
+    ok "pip install completed in $VENV_DIR"
+  else
+    bad "pip install failed:"
+    tail -20 <<<"$out" | sed 's/^/       /'
+    dependency_console_steps
+    record "Dependencies" "FAILED" "see console steps above"
+    return 1
+  fi
+
+  # Verified, not assumed: a zero exit from pip does not guarantee the
+  # packages are importable by the interpreter that will actually run the
+  # agent code — check that directly before trusting it.
+  if "${VENV_DIR}/bin/python3" -c "import strands, dotenv" >/dev/null 2>&1; then
+    PY="${VENV_DIR}/bin/python3"
+    ok "import strands, dotenv — verified in $VENV_DIR"
+    record "Dependencies" "OK" "$VENV_DIR"
+  else
+    bad "pip reported success but 'import strands, dotenv' still fails in $VENV_DIR"
+    dependency_console_steps
+    record "Dependencies" "FAILED" "installed but not importable — check python3/pip versions"
+    return 1
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  2. Preflight
 # ═════════════════════════════════════════════════════════════════════════════
 preflight() {
   phase "Preflight"
@@ -187,6 +287,13 @@ preflight() {
   command -v python3  >/dev/null || die "python3 not found."
   command -v jq       >/dev/null || warn "jq not found — some output parsing will be skipped."
   command -v zip       >/dev/null || warn "zip not found — --package will fail later."
+
+  if [[ "$PY" == "${VENV_DIR}/bin/python3" ]]; then
+    ok "dependencies (strands-agents, python-dotenv) installed automatically at $VENV_DIR"
+  else
+    warn "dependencies are not yet installed — phase 1 (Install Python dependencies)"
+    warn "installs them automatically into $VENV_DIR; see its output above if it failed."
+  fi
 
   local identity account arn
   identity="$(aws sts get-caller-identity --output json 2>/dev/null)" \
@@ -269,7 +376,7 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  2. CloudFormation
+#  3. CloudFormation
 # ═════════════════════════════════════════════════════════════════════════════
 stack_console_steps() {
   cat <<EOF
@@ -354,13 +461,13 @@ deploy_stack() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  3. Seed data
+#  4. Seed data
 # ═════════════════════════════════════════════════════════════════════════════
 seed_console_steps() {
   cat <<EOF
 
    ${BOLD}Seed by hand instead:${RESET}
-     python3 infrastructure/seed_data.py  (from $PROJECT_DIR, with AWS creds set)
+     $PY infrastructure/seed_data.py  (from $PROJECT_DIR, with AWS creds set)
      or, at minimum, upload the three policy documents so the Knowledge
      Bases have something to retrieve:
        s3://$(load policy_bucket)/policies/returns/return_policy.txt
@@ -375,7 +482,7 @@ seed_data_phase() {
 
   local out
   if out="$( cd "$PROJECT_DIR" && AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
-      python3 infrastructure/seed_data.py 2>&1 )"; then
+      "$PY" infrastructure/seed_data.py 2>&1 )"; then
     ok "seed_data.py completed"
     tail -6 <<<"$out" | sed 's/^/       /'
     record "Seed data" "OK" "customers, orders, policy docs"
@@ -389,7 +496,7 @@ seed_data_phase() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  4. Knowledge Bases ×3 — the phase with no project-2 precedent
+#  5. Knowledge Bases ×3 — the phase with no project-2 precedent
 # ═════════════════════════════════════════════════════════════════════════════
 # Titan Embed Text v2 is the embedding model src/bedrock_kb_retrieval.py's own
 # module docstring specifies for all three Knowledge Bases. config.py has no
@@ -608,7 +715,7 @@ ensure_kbs() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  5. Deploy the agent
+#  6. Deploy the agent
 # ═════════════════════════════════════════════════════════════════════════════
 # src/agent_orchestrator.py deploy runs the whole agent-side pipeline in one
 # call: builds the 5-agent graph, creates the enterprise guardrail, deploys
@@ -623,7 +730,7 @@ deploy_agent_phase() {
     AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
     RETURNS_KB_ID="$(load kb_returns)" SHIPPING_KB_ID="$(load kb_shipping)" \
     WARRANTY_KB_ID="$(load kb_warranty)" \
-    python3 src/agent_orchestrator.py deploy 2>&1 )"
+    "$PY" src/agent_orchestrator.py deploy 2>&1 )"
 
   mkdir -p "$EVIDENCE_DIR"
   printf '%s\n' "$out" > "${EVIDENCE_DIR}/deploy_output.txt"
@@ -639,7 +746,7 @@ deploy_agent_phase() {
     cat <<EOF
 
    ${BOLD}Finish by hand instead:${RESET}
-     cd $PROJECT_DIR && python3 src/agent_orchestrator.py deploy
+     cd $PROJECT_DIR && $PY src/agent_orchestrator.py deploy
      Then set AGENTCORE_RUNTIME_ARN / GUARDRAIL_ID / GUARDRAIL_VERSION in $ENV_FILE
 
 EOF
@@ -660,7 +767,7 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  6. Run the Udacity grader
+#  7. Run the Udacity grader
 # ═════════════════════════════════════════════════════════════════════════════
 # Prefers a workspace-provided tests/test_agent.py (e.g. from an earlier
 # upload into the CloudShell home directory) over the embedded copy, and
@@ -681,7 +788,7 @@ run_grader() {
   ( cd "$PROJECT_DIR" && \
     set -a; [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"; set +a; \
     AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
-    python3 tests/test_agent.py all ) 2>&1 | tee "${EVIDENCE_DIR}/pytest_output.txt"
+    "$PY" tests/test_agent.py all ) 2>&1 | tee "${EVIDENCE_DIR}/pytest_output.txt"
   local rc=${PIPESTATUS[0]}
 
   # print_score() in test_agent.py always exits 0 on a real run (it never
@@ -703,7 +810,7 @@ run_grader() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  7. Adversarial guardrail suite (Task 13)
+#  8. Adversarial guardrail suite (Task 13)
 # ═════════════════════════════════════════════════════════════════════════════
 # scripts/run_adversarial.py does not exist yet — it is Task 13 of this plan.
 # This phase is wired in now so that once that task lands and the script is
@@ -719,7 +826,7 @@ run_adversarial_phase() {
     return 0
   fi
 
-  ( cd "$PROJECT_DIR" && python3 scripts/run_adversarial.py --live ) \
+  ( cd "$PROJECT_DIR" && "$PY" scripts/run_adversarial.py --live ) \
     2>&1 | tee "${EVIDENCE_DIR}/adversarial_output.txt"
   local rc=${PIPESTATUS[0]}
   if [[ $rc -eq 0 ]]; then
@@ -732,7 +839,7 @@ run_adversarial_phase() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  8. Package the submission (full form is Task 14)
+#  9. Package the submission (full form is Task 14)
 # ═════════════════════════════════════════════════════════════════════════════
 # This is a minimal package — src/, tests/, infrastructure/, whatever evidence
 # exists, and a redacted .env. Task 14 adds screenshots, adversarial
@@ -847,8 +954,15 @@ teardown() {
     return 1
   fi
 
+  # cleanup.py does `import config`, which unconditionally does
+  # `from dotenv import load_dotenv` — it needs the same venv every other
+  # phase does. install_dependencies() is cheap to re-run: it no-ops
+  # (skip) if $VENV_DIR already satisfies the import check from an earlier
+  # run in this same $HOME.
+  install_dependencies || warn "continuing with system python3 — cleanup.py may fail to import config"
+
   ( cd "$PROJECT_DIR" && AWS_REGION="$REGION" PROJECT_NAME="$PROJECT_NAME" \
-      python3 infrastructure/cleanup.py --yes )
+      "$PY" infrastructure/cleanup.py --yes )
   local rc=$?
 
   rm -rf "$STATE_DIR" "$PROJECT_DIR"
@@ -875,19 +989,24 @@ main() {
     --status)    show_status; exit 0 ;;
     --teardown)  teardown;    exit 0 ;;
     --test-only)
+      banner
       materialise
+      install_dependencies
       preflight
       run_grader
       summary
       exit 0 ;;
     --package)
+      banner
       materialise
       package_submission
+      summary
       exit 0 ;;
   esac
 
   banner
   materialise
+  install_dependencies
   preflight
   deploy_stack
   seed_data_phase
