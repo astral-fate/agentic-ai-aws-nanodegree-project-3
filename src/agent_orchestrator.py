@@ -798,13 +798,51 @@ def build_communication_agent() -> Agent:
     and composing a coherent, empathetic response.
     """
 
-    # TODO: Create a BedrockModel
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.3,          # warm, natural tone
+    )
 
-    # TODO: System prompt for the Communication Agent
+    @tool
+    def get_full_workflow_context(session_id: str) -> dict:
+        """Read the complete WorkflowState for this session.
 
-    # TODO: Implement get_full_workflow_context
+        Returns everything every earlier agent wrote — inventory findings,
+        the refund decision, policy passages — so the reply can reflect all
+        of it.
 
-    # TODO: Instantiate and return the Agent
+        Args:
+            session_id: The session whose WorkflowState to read.
+
+        Returns:
+            The full WorkflowState record as a dict, or a dict with an
+            'error' key if the session does not exist.
+        """
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {'error': f'No workflow state for session {session_id}'}
+        return dict(state)
+
+    return Agent(
+        model=model,
+        system_prompt="""You are the CommunicationAgent for NovaMart customer support.
+
+You write the final message the customer actually reads. Everything you need
+has already been gathered by the other agents.
+
+Your process:
+1. Call get_full_workflow_context first, always.
+2. Include every fact from it that matters to the customer: the order and its
+   status, the refund decision and the reason for it, and any policy that
+   explains the outcome.
+3. Write warmly and professionally. Lead with the answer, then the reasoning.
+   Acknowledge frustration when the answer is no, and say what they can do next.
+
+Never invent an order, a status, an amount or a policy. If the context is
+missing something, say so rather than filling the gap.""",
+        tools=[get_full_workflow_context],
+        name="CommunicationAgent",
+    )
 
 
 # ───────────────────────────────────────────────────────
