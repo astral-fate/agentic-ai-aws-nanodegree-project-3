@@ -15,6 +15,16 @@ counterpart to [`../run-01`](../run-01/INDEX.md), which is the offline run.
 | [`01b-test-score-tail.png`](screenshots/01b-test-score-tail.png) | Tail of the same run, through packaging | supporting |
 | [`02-xray-service-map.png`](screenshots/02-xray-service-map.png) | X-Ray Trace Map: `Client → NovaMart…estrator` → PolicyAgent, CommunicationAgent, KnowledgeBase:returns, KnowledgeBase:warranty — all `Remote` nodes | **Yes** |
 | [`03-scenario-run-with-trace-ids.png`](screenshots/03-scenario-run-with-trace-ids.png) | The three brief scenarios running live, each printing its X-Ray trace id | supporting |
+| [`03-knowledge-bases.png`](screenshots/03-knowledge-bases.png) | The three Bedrock Knowledge Bases in the console | supporting |
+| [`05-guardrail.png`](screenshots/05-guardrail.png) | `udacity-agentcore-guardrail`, status Ready | supporting |
+
+Two further captures — the AgentCore runtime page and the CloudWatch log group —
+were attempted by `scripts/capture_console.py` and **rejected by its blank-render
+detector**: one landed on the AgentCore marketing overview rather than the runtime
+list, the other rendered 571 characters. They are not in this directory, because a
+screenshot of the wrong page is worse than no screenshot. The detector also
+declined to overwrite the Service Map capture above with a blank, which is the
+reason that file survived an automated re-run.
 
 ## Graded result
 

@@ -59,7 +59,8 @@ $TargetPatterns = @(
     'customer-support',    # project 2 gateway / memory
     'CustomerSupport',     # project 2 CamelCase resources
     'order-tracker',       # project 2 lambda
-    'refund-processor'     # project 2 lambda
+    'refund-processor',    # project 2 lambda
+    'support-chatbot'      # project 1/2 guardrail, seen in the console
 ) + $ExtraPatterns
 
 function Test-IsTarget([string] $Name) {
