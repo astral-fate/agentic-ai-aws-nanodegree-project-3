@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .env
 .aws-console-profile/
+*.zip
+!novamart-submission.zip
