@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd \\\"D:/aws nano/agentic-ai-aws-nanodegree-project-3\\\" && cat > docs/superpowers/specs/2026-09-16-project-3-novamart-design.md <<'SPECEOF'\\n# NovaMart multi-agent customer support — design...",
-  "error": "Exit code 2\n/usr/bin/bash: -c: line 163: unexpected EOF while looking for matching `''",
-  "timestamp": "2026-09-16T16:18:40.289Z",
-  "retry_count": 1
-}
