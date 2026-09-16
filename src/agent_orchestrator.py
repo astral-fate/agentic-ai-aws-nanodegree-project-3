@@ -889,21 +889,34 @@ def build_orchestrator_agent(
     def initialize_session(session_id: str, customer_id: str) -> dict:
         """Create the shared WorkflowState record for a new customer request.
 
-        Must be the first tool called on every request. If this session_id
-        was already initialized (e.g. a retried or reused session), the
-        existing WorkflowState record is returned instead of raising.
+        Must be the first tool called on every request.
+
+        Idempotent, but only for the SAME customer: if this session_id was
+        already initialized (e.g. a retried or reused session) for the same
+        customer_id, the existing WorkflowState record is returned instead of
+        raising. If session_id already belongs to a DIFFERENT customer, this
+        refuses and returns an error dict rather than that other customer's
+        record - a session id must never hand one customer's order, tier or
+        refund history to another customer.
 
         Args:
             session_id:  Unique id for this conversation.
             customer_id: The customer making the request, e.g. "CUST-001".
 
         Returns:
-            The WorkflowState record for this session.
+            The WorkflowState record for this session, or a dict with an
+            'error' key if session_id is already owned by another customer.
         """
         try:
             return _create_workflow_state(session_id, customer_id)
         except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-            return _read_workflow_state(session_id)
+            existing = _read_workflow_state(session_id)
+            if existing and existing.get('customer_id') != customer_id:
+                return {'error': (
+                    f'Session {session_id} is already owned by customer '
+                    f"{existing.get('customer_id')!r}, not {customer_id!r}"
+                )}
+            return existing
 
     @tool
     def route_to_inventory_agent(session_id: str, query: str) -> dict:

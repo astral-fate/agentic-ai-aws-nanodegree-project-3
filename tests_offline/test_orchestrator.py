@@ -77,6 +77,35 @@ def test_communication_is_always_the_last_call(orch, prompt):
     assert _route(orch, prompt)[-1] == "route_to_communication_agent"
 
 
+def test_initialize_session_refuses_a_different_customer_on_same_session(orch):
+    """A session id must never hand one customer's WorkflowState to another.
+
+    initialize_session is idempotent for repeat calls from the SAME customer
+    (e.g. a retried request), but if a session_id is already owned by a
+    different customer_id it must refuse - not silently return the first
+    customer's order/tier/refund history to the second customer.
+    """
+    init = orch.tool_registry.registry["initialize_session"]
+    sid = "s-cross-customer"
+
+    first = init(session_id=sid, customer_id="CUST-001")
+    assert first["customer_id"] == "CUST-001"
+    assert "error" not in first
+
+    # Different customer, same session id: must be refused, not handed
+    # CUST-001's record.
+    second = init(session_id=sid, customer_id="CUST-002")
+    assert "error" in second
+    assert second.get("customer_id") != "CUST-001"
+    assert second.get("customer_id") != "CUST-002"
+
+    # The same customer re-initializing the same session is still fine
+    # (idempotence for the legitimate case is preserved).
+    again = init(session_id=sid, customer_id="CUST-001")
+    assert again["customer_id"] == "CUST-001"
+    assert "error" not in again
+
+
 def test_routing_tools_thread_the_version_they_just_read(orchestrator, orch):
     """Each routing tool must pass the version it just read, not a constant."""
     scripted_model.reset_calls()
