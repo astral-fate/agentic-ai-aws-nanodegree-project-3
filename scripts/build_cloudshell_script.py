@@ -46,6 +46,7 @@ FILES: List[Tuple[str, str, str]] = [
     ("infrastructure/seed_data.py", "infrastructure/seed_data.py", "SEED_DATA_PY_EOF"),
     ("infrastructure/cleanup.py", "infrastructure/cleanup.py", "CLEANUP_PY_EOF"),
     ("scripts/run_adversarial.py", "scripts/run_adversarial.py", "RUN_ADVERSARIAL_PY_EOF"),
+    ("scripts/run_scenarios.py", "scripts/run_scenarios.py", "RUN_SCENARIOS_PY_EOF"),
 ]
 
 INDENT = "  "

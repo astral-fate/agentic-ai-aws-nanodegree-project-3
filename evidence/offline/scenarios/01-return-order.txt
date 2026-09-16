@@ -1,0 +1,13 @@
+scenario:         01-return-order
+session_id:       s-offline-750a0f8b
+customer_id:      CUST-001
+message:          I want to return my order ORD-27176
+expected_routing: Orchestrator -> Inventory -> Refund -> Communication
+actual_agents_called: OrchestratorAgent -> InventoryAgent -> RefundAgent -> CommunicationAgent
+tool_calls:           ['OrchestratorAgent.initialize_session', 'OrchestratorAgent.route_to_inventory_agent', 'InventoryAgent.check_order_status', 'OrchestratorAgent.route_to_refund_agent', 'RefundAgent.get_inventory_context', 'RefundAgent.initiate_refund', 'OrchestratorAgent.route_to_communication_agent', 'CommunicationAgent.get_full_workflow_context']
+
+response:
+done
+
+caveat:
+Offline mode: this ran the real, unmodified five-agent graph in-process against harness/scripted_model.py, a rule-based (not an LLM) stand-in for the model. It shows the tool wiring and routing rules are correct for this prompt - it does not show a real model would route it the same way, and there is no deployed runtime, so no X-Ray trace exists.

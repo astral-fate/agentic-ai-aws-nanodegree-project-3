@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v01.sh              deploy everything, then grade it
-#     bash deploy-e2e-v01.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v01.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v01.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v01.sh --teardown   delete everything it created
+#     bash deploy-e2e-v02.sh              deploy everything, then grade it
+#     bash deploy-e2e-v02.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v02.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v02.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v02.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v01.sh --teardown
+#     bash deploy-e2e-v02.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v01.sh
+    bash cloudshell/deploy-e2e-v02.sh
 
 REFUSE
   exit 2
@@ -78,7 +78,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v01"
+SCRIPT_VERSION="v02"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -186,6 +186,7 @@ __EMBEDDED_FILES__
   ok "infrastructure/seed_data.py"
   ok "infrastructure/cleanup.py"
   ok "scripts/run_adversarial.py"
+  ok "scripts/run_scenarios.py"
   record "Project files" "OK" "$PROJECT_DIR"
 
   # Resolved after materialise, since they are read out of the embedded
@@ -840,28 +841,117 @@ run_adversarial_phase() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  9. Package the submission (full form is Task 14)
+#  9. Scenario transcripts (Task 14)
 # ═════════════════════════════════════════════════════════════════════════════
-# This is a minimal package — src/, tests/, infrastructure/, whatever evidence
-# exists, and a redacted .env. Task 14 adds screenshots, adversarial
-# transcripts and an INDEX.md; this gives the flag something real to do
-# until then, rather than a no-op.
+# scripts/run_scenarios.py runs the three Udacity-brief scenarios against the
+# just-deployed runtime and writes one transcript each, plus an X-Ray trace
+# lookup per scenario. It needs a real runtime_arn — if deploy_agent_phase
+# never ran (e.g. a bare --package on an undeployed project), this skips
+# rather than failing the whole run.
+run_scenarios_phase() {
+  phase "Scenario transcripts (scripts/run_scenarios.py)"
+  local script="${PROJECT_DIR}/scripts/run_scenarios.py"
+
+  if [[ ! -f "$script" ]]; then
+    skip "scripts/run_scenarios.py not present — skipping"
+    record "Scenario transcripts" "SKIPPED" "script not found"
+    return 0
+  fi
+  if [[ -z "$(load runtime_arn)" ]] && ! grep -q '^AGENTCORE_RUNTIME_ARN=.' "$ENV_FILE" 2>/dev/null; then
+    skip "no deployed runtime yet — run a full deploy first"
+    record "Scenario transcripts" "SKIPPED" "no runtime_arn"
+    return 0
+  fi
+
+  ( cd "$PROJECT_DIR" && \
+    set -a; [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"; set +a; \
+    "$PY" scripts/run_scenarios.py --live --run-name live ) \
+    2>&1 | tee "${EVIDENCE_DIR}/scenarios_output.txt"
+  local rc=${PIPESTATUS[0]}
+  if [[ $rc -eq 0 ]]; then
+    ok "scenario transcripts written to ${EVIDENCE_DIR}/scenarios"
+    record "Scenario transcripts" "OK" "${EVIDENCE_DIR}/scenarios"
+  else
+    warn "scenario run reported at least one failure (exit $rc)"
+    record "Scenario transcripts" "PARTIAL" "${EVIDENCE_DIR}/scenarios_output.txt"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  10. Package the submission
+# ═════════════════════════════════════════════════════════════════════════════
+# Produces novamart-submission.zip: src/agent_orchestrator.py, .env with every
+# value redacted (key names kept), both required screenshots
+# (01-test-score.png, 02-xray-service-map.png) if present, the adversarial
+# suite, the scenario transcripts, and an INDEX.md that says plainly which
+# parts are live and which are still missing.
+#
+# Screenshots are captured locally by scripts/capture_console.py (it drives a
+# real signed-in Chrome session — CloudShell has no GUI for that), so this
+# phase looks for them at ${EVIDENCE_DIR}/screenshots/*.png. Upload that
+# directory into CloudShell (Actions → Upload file) before running --package
+# if you captured them on a laptop rather than in this same CloudShell home.
 package_submission() {
   phase "Packaging the submission"
 
   local staging="/tmp/novamart-submission" out="${HOME}/novamart-submission.zip"
   rm -rf "$staging" "$out"
-  mkdir -p "$staging/evidence"
+  mkdir -p "$staging/src" "$staging/screenshots" "$staging/adversarial" "$staging/scenarios"
 
-  cp -r "$PROJECT_DIR/src" "$staging/" 2>/dev/null
+  # ── src/agent_orchestrator.py (explicitly required by the rubric) ─────────
+  if [[ -f "$PROJECT_DIR/src/agent_orchestrator.py" ]]; then
+    cp "$PROJECT_DIR/src/agent_orchestrator.py" "$staging/src/"
+    ok "src/agent_orchestrator.py"
+  else
+    warn "src/agent_orchestrator.py not found in $PROJECT_DIR — materialise() may not have run"
+  fi
+  # The rest of src/, tests/ and infrastructure/ too — more context for a
+  # reviewer costs nothing and the rubric's minimum list is a floor, not a
+  # ceiling.
   cp -r "$PROJECT_DIR/tests" "$staging/" 2>/dev/null
   cp -r "$PROJECT_DIR/infrastructure" "$staging/" 2>/dev/null
-  [[ -d "$EVIDENCE_DIR" ]] && cp -r "$EVIDENCE_DIR" "$staging/evidence/live" 2>/dev/null
+  cp -r "$PROJECT_DIR/src" "$staging/src_full" 2>/dev/null
 
+  # ── .env, every value redacted, key names kept ─────────────────────────────
   if [[ -f "$ENV_FILE" ]]; then
-    sed -E 's/=.*/=REDACTED/' "$ENV_FILE" > "$staging/env.redacted.txt"
+    # Only lines that actually assign a key (KEY=value) are touched, so
+    # comments and blank lines in .env stay readable in the submission.
+    sed -E '/^[A-Za-z_][A-Za-z0-9_]*=/ s/=.*/=REDACTED/' "$ENV_FILE" > "$staging/.env"
+    ok ".env (redacted)"
+  else
+    warn "no .env found at $ENV_FILE — nothing to redact"
   fi
 
+  # ── screenshots — captured locally, not by this script ─────────────────────
+  local shots_src="${EVIDENCE_DIR}/screenshots"
+  local shots_found=0
+  if [[ -d "$shots_src" ]]; then
+    cp "$shots_src"/*.png "$staging/screenshots/" 2>/dev/null
+    shots_found=$(find "$staging/screenshots" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [[ -f "$staging/screenshots/01-test-score.png" && -f "$staging/screenshots/02-xray-service-map.png" ]]; then
+    ok "both required screenshots present ($shots_found total)"
+    record "Screenshots" "OK" "$shots_found found, both required present"
+  elif [[ "$shots_found" -gt 0 ]]; then
+    warn "only $shots_found screenshot(s) found — the two REQUIRED shots are"
+    warn "01-test-score.png and 02-xray-service-map.png. Run scripts/capture_console.py"
+    warn "locally and copy its output into ${shots_src}, then re-run --package."
+    record "Screenshots" "PARTIAL" "$shots_found found, required ones missing"
+  else
+    warn "no screenshots found at $shots_src"
+    warn "run scripts/capture_console.py locally, then copy its output here."
+    record "Screenshots" "MISSING" "run scripts/capture_console.py, see cloudshell/README.md"
+  fi
+
+  # ── adversarial suite + scenario transcripts, whichever ran ────────────────
+  [[ -d "${EVIDENCE_DIR}/adversarial" ]] && cp -r "${EVIDENCE_DIR}/adversarial"/. "$staging/adversarial/" 2>/dev/null
+  [[ -d "${EVIDENCE_DIR}/scenarios" ]]   && cp -r "${EVIDENCE_DIR}/scenarios"/.   "$staging/scenarios/"   2>/dev/null
+  local adv_count=$(find "$staging/adversarial" -type f 2>/dev/null | wc -l | tr -d ' ')
+  local scen_count=$(find "$staging/scenarios" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$adv_count"  -gt 0 ]] && ok "adversarial suite ($adv_count files)"  || warn "no adversarial evidence found at ${EVIDENCE_DIR}/adversarial"
+  [[ "$scen_count" -gt 0 ]] && ok "scenario transcripts ($scen_count files)" || warn "no scenario transcripts found at ${EVIDENCE_DIR}/scenarios"
+
+  # ── DEPLOYED_RESOURCES.txt — kept for a quick human-readable summary ──────
   {
     printf 'NovaMart submission — packaged %s by deploy-e2e %s\n\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_VERSION"
@@ -871,13 +961,51 @@ package_submission() {
     printf '  Returns KB      %s\n' "$(load kb_returns)"
     printf '  Shipping KB     %s\n' "$(load kb_shipping)"
     printf '  Warranty KB     %s\n' "$(load kb_warranty)"
-    printf '\nFull evidence capture, console screenshots and INDEX.md are added by Task 14.\n'
   } > "$staging/DEPLOYED_RESOURCES.txt"
+
+  # ── INDEX.md — states plainly what is here and what is missing ────────────
+  {
+    printf '# NovaMart submission index\n\n'
+    printf 'Packaged %s by deploy-e2e %s.\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_VERSION"
+    printf '## Contents\n\n'
+    printf '| Item | Status |\n|---|---|\n'
+    if [[ -f "$staging/src/agent_orchestrator.py" ]]; then
+      printf '| src/agent_orchestrator.py | present |\n'
+    else
+      printf '| src/agent_orchestrator.py | MISSING |\n'
+    fi
+    if [[ -f "$staging/.env" ]]; then
+      printf '| .env (redacted) | present — every value replaced with REDACTED, key names kept |\n'
+    else
+      printf '| .env (redacted) | MISSING |\n'
+    fi
+    if [[ -f "$staging/screenshots/01-test-score.png" ]]; then
+      printf '| screenshots/01-test-score.png (required) | present |\n'
+    else
+      printf '| screenshots/01-test-score.png (required) | MISSING |\n'
+    fi
+    if [[ -f "$staging/screenshots/02-xray-service-map.png" ]]; then
+      printf '| screenshots/02-xray-service-map.png (required) | present |\n'
+    else
+      printf '| screenshots/02-xray-service-map.png (required) | MISSING |\n'
+    fi
+    printf '| screenshots/ (supporting, 03-06) | %s file(s) |\n' "$shots_found"
+    printf '| adversarial/ | %s file(s) |\n' "$adv_count"
+    printf '| scenarios/ | %s file(s) |\n' "$scen_count"
+    printf '\n## Honesty note\n\n'
+    printf 'This zip was assembled by an automated script. A "present" row above\n'
+    printf 'means the file existed on disk when packaged — it does not by itself\n'
+    printf 'prove the screenshot shows what its filename claims. Open every\n'
+    printf 'screenshot before submitting. A MISSING row for either required\n'
+    printf 'screenshot means the submission is not yet complete: run\n'
+    printf '`scripts/capture_console.py` locally against the signed-in AWS console\n'
+    printf 'and copy its output into `%s` before re-running --package.\n' "$shots_src"
+  } > "$staging/INDEX.md"
 
   if command -v zip >/dev/null 2>&1; then
     ( cd "$staging" && zip -qr "$out" . )
     ok "$out ($(du -h "$out" 2>/dev/null | cut -f1))"
-    printf '\n   %sDownload it:%s CloudShell → Actions → Download file → paste:\n' "$BOLD" "$RESET"
+    printf '\n   %sDownload it:%s CloudShell → Actions → Download file → paste this exact path:\n' "$BOLD" "$RESET"
     printf '     %s\n\n' "$out"
     record "Package" "OK" "$out"
   else
@@ -1000,6 +1128,8 @@ main() {
     --package)
       banner
       materialise
+      install_dependencies || warn "continuing without a verified venv — run_scenarios_phase may fail to import config"
+      run_scenarios_phase
       package_submission
       summary
       exit 0 ;;
@@ -1015,6 +1145,7 @@ main() {
   deploy_agent_phase
   run_grader
   run_adversarial_phase
+  run_scenarios_phase
   package_submission
   summary
 }

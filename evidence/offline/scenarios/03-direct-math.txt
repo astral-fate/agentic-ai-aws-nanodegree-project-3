@@ -1,0 +1,13 @@
+scenario:         03-direct-math
+session_id:       s-offline-68dae1cd
+customer_id:      CUST-003
+message:          How much are 5 items at $29.99 with 10% off?
+expected_routing: Orchestrator answers directly - no worker routing
+actual_agents_called: OrchestratorAgent -> CommunicationAgent
+tool_calls:           ['OrchestratorAgent.initialize_session', 'OrchestratorAgent.route_to_communication_agent', 'CommunicationAgent.get_full_workflow_context']
+
+response:
+done
+
+caveat:
+Offline mode: this ran the real, unmodified five-agent graph in-process against harness/scripted_model.py, a rule-based (not an LLM) stand-in for the model. It shows the tool wiring and routing rules are correct for this prompt - it does not show a real model would route it the same way, and there is no deployed runtime, so no X-Ray trace exists.

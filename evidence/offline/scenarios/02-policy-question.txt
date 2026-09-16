@@ -1,0 +1,13 @@
+scenario:         02-policy-question
+session_id:       s-offline-db9672e8
+customer_id:      CUST-002
+message:          What is the return policy for premium customers?
+expected_routing: Orchestrator -> Policy (3 parallel retrievers: returns, shipping, warranty) -> Communication
+actual_agents_called: OrchestratorAgent -> PolicyAgent -> ReturnsPolicyRetrieverAgent -> ShippingPolicyRetrieverAgent -> WarrantyPolicyRetrieverAgent -> CommunicationAgent
+tool_calls:           ['OrchestratorAgent.initialize_session', 'OrchestratorAgent.route_to_policy_agent', 'PolicyAgent.search_all_policies', 'ReturnsPolicyRetrieverAgent.search_returns_policy', 'ShippingPolicyRetrieverAgent.search_shipping_policy', 'WarrantyPolicyRetrieverAgent.search_warranty_policy', 'OrchestratorAgent.route_to_communication_agent', 'CommunicationAgent.get_full_workflow_context']
+
+response:
+done
+
+caveat:
+Offline mode: this ran the real, unmodified five-agent graph in-process against harness/scripted_model.py, a rule-based (not an LLM) stand-in for the model. It shows the tool wiring and routing rules are correct for this prompt - it does not show a real model would route it the same way, and there is no deployed runtime, so no X-Ray trace exists.

@@ -6,11 +6,11 @@
 #  nothing is cloned and nothing is downloaded except from AWS itself.
 #  Paste this into AWS CloudShell and run it.
 #
-#     bash deploy-e2e-v01.sh              deploy everything, then grade it
-#     bash deploy-e2e-v01.sh --status     show what exists, change nothing
-#     bash deploy-e2e-v01.sh --test-only  re-run the grader against what is there
-#     bash deploy-e2e-v01.sh --package    zip src/ + evidence for submission
-#     bash deploy-e2e-v01.sh --teardown   delete everything it created
+#     bash deploy-e2e-v02.sh              deploy everything, then grade it
+#     bash deploy-e2e-v02.sh --status     show what exists, change nothing
+#     bash deploy-e2e-v02.sh --test-only  re-run the grader against what is there
+#     bash deploy-e2e-v02.sh --package    zip src/ + evidence for submission
+#     bash deploy-e2e-v02.sh --teardown   delete everything it created
 #
 #  ─────────────────────────────────────────────────────────────────────────
 #  COST — read this before running
@@ -23,7 +23,7 @@
 #  A Knowledge Base with an S3 Vectors index left running is not free just
 #  because nothing is querying it. Finish, screenshot, then immediately:
 #
-#     bash deploy-e2e-v01.sh --teardown
+#     bash deploy-e2e-v02.sh --teardown
 #
 #  The script prints that reminder again at the end.
 #  ─────────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ This is the template, not the runnable script.
 
   Run the generated one instead, e.g.:
 
-    bash cloudshell/deploy-e2e-v01.sh
+    bash cloudshell/deploy-e2e-v02.sh
 
 REFUSE
   exit 2
@@ -78,7 +78,7 @@ fi
 # Bumped on every fix. The generated file is named deploy-e2e-<version>.sh and
 # the banner prints it, so an uploaded copy can never be confused with an
 # older one sitting in the same directory.
-SCRIPT_VERSION="v01"
+SCRIPT_VERSION="v02"
 
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -5406,6 +5406,398 @@ if __name__ == "__main__":
     sys.exit(main())
 RUN_ADVERSARIAL_PY_EOF
 
+  mkdir -p "$(dirname "$PROJECT_DIR/scripts/run_scenarios.py")"
+  cat > "$PROJECT_DIR/scripts/run_scenarios.py" <<'RUN_SCENARIOS_PY_EOF'
+#!/usr/bin/env python3
+"""Run the three Udacity brief scenarios and write one transcript each.
+
+    python scripts/run_scenarios.py --offline   # in-process harness, no AWS
+    python scripts/run_scenarios.py --live      # real deployed runtime
+
+Scenarios (fixed, from the Udacity brief):
+
+  1. "I want to return my order ORD-27176" as CUST-001
+       -> Orchestrator -> Inventory -> Refund -> Communication
+  2. "What is the return policy for premium customers?"
+       -> Orchestrator -> Policy (3 parallel retrievers) -> Communication
+  3. "How much are 5 items at $29.99 with 10% off?"
+       -> Orchestrator answers directly (no worker routing)
+
+--offline and --live are two different claims, kept as separate as
+run_adversarial.py keeps its own two modes:
+
+  --offline  Boots the harness + fake-strands stand-in
+             (harness/bootstrap.py), builds the real, unmodified five-agent
+             graph, and calls the orchestrator **in-process** - no network,
+             no deployed runtime. harness/scripted_model.py is a rule-based
+             stand-in for the LLM (regex/keyword routing, not a model
+             decision), so this proves the tool wiring and WorkflowState
+             threading are right for these three prompts, never that a real
+             model would route them the same way. There is no X-Ray trace to
+             look up offline - nothing was deployed - so the transcript says
+             exactly that instead of inventing a trace id.
+
+  --live     Calls agent_orchestrator.invoke_agent() - unmodified,
+             pre-written - against a real deployed AgentCore Runtime, then
+             looks up the matching AWS X-Ray trace.
+
+This machine has no AWS credentials and nothing deployed (see MEMORY.md), so
+--offline is the only mode that has actually been run here. --live only
+works from a real session with a deployed runtime, wired into
+cloudshell/_deploy-e2e.template.sh.
+
+X-Ray trace lookup (--live only)
+---------------------------------
+agent_orchestrator.invoke_agent() (pre-written, not modified here) only
+returns the assembled response text - no trace id travels back over that
+API call, and the actual segment is written *inside* the running
+AgentCore Runtime container, which this process cannot read directly.
+
+So the trace id is looked up the only honest way available from outside the
+container: AWS X-Ray's GetTraceSummaries, restricted to the time window this
+scenario's call actually ran in, polled with the same ingestion-delay
+patience as capture_console.py's Service Map shot (traces take 30-60s to
+appear). This is a **time-window** lookup, not a targeted one: the code that
+builds the real X-Ray segments observed live (AgentCore Runtime's own
+auto-instrumentation via CloudWatch Transaction Search, configured by
+agent_orchestrator.configure_observability()) was never exercised against
+real AWS from this machine, so the exact segment/service name it uses in
+practice is unverified. If GetTraceSummaries returns more than one trace in
+a scenario's window, all of them are reported - never silently narrowed to a
+guess - so a human can correlate by timestamp against the transcript.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import pathlib
+import sys
+import time
+import uuid
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# ─────────────────────────────────────────────────────────────
+# THE FIXED SCENARIO LIST (verbatim from the Udacity brief)
+# ─────────────────────────────────────────────────────────────
+SCENARIOS = [
+    {
+        "id": "01-return-order",
+        "customer_id": "CUST-001",
+        "message": "I want to return my order ORD-27176",
+        "expected_routing": "Orchestrator -> Inventory -> Refund -> Communication",
+    },
+    {
+        "id": "02-policy-question",
+        "customer_id": "CUST-002",
+        "message": "What is the return policy for premium customers?",
+        "expected_routing": "Orchestrator -> Policy (3 parallel retrievers: "
+                            "returns, shipping, warranty) -> Communication",
+    },
+    {
+        "id": "03-direct-math",
+        "customer_id": "CUST-003",
+        "message": "How much are 5 items at $29.99 with 10% off?",
+        "expected_routing": "Orchestrator answers directly - no worker routing",
+    },
+]
+
+_OFFLINE_CAVEAT = (
+    "Offline mode: this ran the real, unmodified five-agent graph in-process "
+    "against harness/scripted_model.py, a rule-based (not an LLM) stand-in "
+    "for the model. It shows the tool wiring and routing rules are correct "
+    "for this prompt - it does not show a real model would route it the "
+    "same way, and there is no deployed runtime, so no X-Ray trace exists."
+)
+
+_LIVE_CAVEAT = (
+    "Live mode: this is the actual response from invoke_agent() against the "
+    "deployed AgentCore Runtime. The X-Ray trace id below (if any) comes "
+    "from a GetTraceSummaries lookup over this call's time window, not from "
+    "a targeted trace id returned by invoke_agent_runtime() itself - see the "
+    "module docstring for why that lookup can't be more precise than a "
+    "time window from outside the container."
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# OFFLINE MODE - in-process, no AWS
+# ─────────────────────────────────────────────────────────────
+
+def run_offline() -> list[dict]:
+    """Build the real five-agent graph in-process (harness/bootstrap.py) and
+    run each scenario through it directly, exactly like
+    `agent_orchestrator.py test` does. No invoke_agent(), no AWS network
+    call - this only proves the in-process wiring."""
+    from harness import bootstrap, scripted_model
+
+    orchestrator_module = bootstrap.load_orchestrator()
+
+    inventory_agent     = orchestrator_module.build_inventory_agent()
+    refund_agent        = orchestrator_module.build_refund_agent()
+    policy_agent        = orchestrator_module.build_policy_agent()
+    communication_agent = orchestrator_module.build_communication_agent()
+    orchestrator = orchestrator_module.build_orchestrator_agent(
+        inventory_agent, refund_agent, policy_agent, communication_agent
+    )
+
+    report = []
+    for scenario in SCENARIOS:
+        session_id = f"s-offline-{uuid.uuid4().hex[:8]}"
+        scripted_model.reset_calls()
+        prompt = (f"[Session ID: {session_id}] "
+                  f"[Customer ID: {scenario['customer_id']}] {scenario['message']}")
+        try:
+            response = str(orchestrator(prompt))
+            calls = list(scripted_model.calls)
+            error = None
+        except Exception as exc:  # noqa: BLE001 - one scenario must not lose the rest
+            response, calls, error = "", [], str(exc)
+
+        agents_called = " -> ".join(dict.fromkeys(name for name, _tool in calls)) or "(none)"
+        report.append({
+            "id": scenario["id"],
+            "session_id": session_id,
+            "customer_id": scenario["customer_id"],
+            "message": scenario["message"],
+            "expected_routing": scenario["expected_routing"],
+            "response": response,
+            "actual_agents_called": agents_called,
+            "tool_calls": [f"{agent}.{tool_name}" for agent, tool_name in calls],
+            "trace_id": None,
+            "trace_note": "offline: nothing deployed, no X-Ray trace exists",
+            "error": error,
+            "caveat": _OFFLINE_CAVEAT,
+        })
+    return report
+
+
+# ─────────────────────────────────────────────────────────────
+# LIVE MODE - a real invocation of the deployed runtime
+# ─────────────────────────────────────────────────────────────
+
+def _lookup_xray_trace_ids(start_ts: float, end_ts: float, region: str,
+                            wait: int, poll_interval: int = 10) -> tuple[list[str], str]:
+    """Poll AWS X-Ray for traces whose events fall in [start_ts, end_ts].
+
+    Returns (trace_ids, note). Never raises - a missing/misconfigured X-Ray
+    client is reported in `note`, not fabricated as an empty-but-successful
+    result.
+    """
+    try:
+        import boto3
+    except ImportError:
+        return [], "boto3 not available - cannot query X-Ray"
+
+    try:
+        xray = boto3.client("xray", region_name=region)
+    except Exception as exc:  # noqa: BLE001
+        return [], f"could not create an X-Ray client: {exc}"
+
+    deadline = time.time() + wait
+    last_note = ""
+    while True:
+        try:
+            resp = xray.get_trace_summaries(
+                StartTime=dt.datetime.utcfromtimestamp(start_ts - 5),
+                EndTime=dt.datetime.utcfromtimestamp(max(end_ts, time.time()) + 1),
+                TimeRangeType="Event",
+            )
+            summaries = resp.get("TraceSummaries", [])
+            ids = [s["Id"] for s in summaries if "Id" in s]
+            if ids:
+                return ids, "GetTraceSummaries, time-window match (see module docstring)"
+            last_note = "no traces found in this window yet"
+        except Exception as exc:  # noqa: BLE001
+            last_note = f"GetTraceSummaries failed: {exc}"
+            break  # a real error (e.g. no credentials) won't fix itself by polling
+
+        if time.time() >= deadline:
+            break
+        time.sleep(poll_interval)
+
+    return [], last_note or "no traces found"
+
+
+def run_live(xray_wait: int, xray_poll_interval: int) -> list[dict]:
+    """Send each scenario through the deployed runtime via invoke_agent()
+    (pre-written, unmodified), then look up its X-Ray trace by time window."""
+    import config
+    import agent_orchestrator
+
+    region = config.AWS_REGION
+    report = []
+    call_windows = []
+
+    for scenario in SCENARIOS:
+        session_id = f"s-live-{uuid.uuid4().hex[:8]}"
+        start_ts = time.time()
+        entry = {
+            "id": scenario["id"],
+            "session_id": session_id,
+            "customer_id": scenario["customer_id"],
+            "message": scenario["message"],
+            "expected_routing": scenario["expected_routing"],
+            "caveat": _LIVE_CAVEAT,
+        }
+        try:
+            response = agent_orchestrator.invoke_agent(
+                session_id, scenario["customer_id"], scenario["message"])
+            entry["response"] = response
+            entry["error"] = None
+        except Exception as exc:  # noqa: BLE001 - one scenario must not lose the rest
+            entry["response"] = ""
+            entry["error"] = str(exc)
+        entry["_start_ts"] = start_ts
+        entry["_end_ts"] = time.time()
+        report.append(entry)
+        print(f"  [{scenario['id']}] session={session_id} -> "
+              f"{'ERROR: ' + entry['error'] if entry['error'] else entry['response'][:120]}")
+
+    print(f"\nWaiting up to {xray_wait}s per scenario for X-Ray to ingest the traces...")
+    for entry in report:
+        ids, note = _lookup_xray_trace_ids(
+            entry["_start_ts"], entry["_end_ts"], region, xray_wait, xray_poll_interval
+        )
+        entry["trace_ids"] = ids
+        entry["trace_note"] = note
+        entry["trace_id"] = ids[0] if len(ids) == 1 else None
+        label = ids[0] if len(ids) == 1 else (f"{len(ids)} candidates: {ids}" if ids else "none")
+        print(f"  [{entry['id']}] X-Ray trace(s): {label}  ({note})")
+        del entry["_start_ts"], entry["_end_ts"]
+
+    return report
+
+
+# ─────────────────────────────────────────────────────────────
+# EVIDENCE OUTPUT
+# ─────────────────────────────────────────────────────────────
+
+def _write_evidence(mode: str, report: list[dict], out_dir: pathlib.Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for entry in report:
+        transcript = out_dir / f"{entry['id']}.txt"
+        lines = [
+            f"scenario:         {entry['id']}",
+            f"session_id:       {entry['session_id']}",
+            f"customer_id:      {entry['customer_id']}",
+            f"message:          {entry['message']}",
+            f"expected_routing: {entry['expected_routing']}",
+        ]
+        if mode == "offline":
+            lines += [
+                f"actual_agents_called: {entry['actual_agents_called']}",
+                f"tool_calls:           {entry['tool_calls']}",
+            ]
+        else:
+            if entry.get("trace_ids"):
+                lines.append(f"xray_trace_ids:   {', '.join(entry['trace_ids'])}")
+            else:
+                lines.append("xray_trace_ids:   (none found)")
+            lines.append(f"xray_lookup_note: {entry['trace_note']}")
+        if entry.get("error"):
+            lines.append(f"error:            {entry['error']}")
+        lines += ["", "response:", entry.get("response", "") or "(empty)",
+                  "", "caveat:", entry["caveat"], ""]
+        transcript.write_text("\n".join(lines), encoding="utf-8")
+
+    index_lines = [
+        f"# Scenario transcripts -- {mode.upper()}",
+        "",
+    ]
+    if mode == "offline":
+        index_lines += [
+            "Run in-process against the real five-agent graph and "
+            "`harness/scripted_model.py` (a rule-based stand-in for the "
+            "model, not a live LLM decision) - no deployed runtime, no "
+            "X-Ray trace. This shows the tool wiring is correct for these "
+            "three prompts, not that a real model would route them the "
+            "same way.",
+            "",
+            "| scenario | message | expected routing | agents actually called |",
+            "|---|---|---|---|",
+        ]
+        for e in report:
+            index_lines.append(
+                f"| {e['id']} | {e['message']} | {e['expected_routing']} | "
+                f"{e['actual_agents_called']} |"
+            )
+    else:
+        index_lines += [
+            "Run against the real deployed AgentCore Runtime via "
+            "`invoke_agent()`. The X-Ray trace id is a time-window lookup "
+            "(see run_scenarios.py's module docstring) - if more than one "
+            "candidate trace appears, all are listed rather than guessed.",
+            "",
+            "| scenario | message | expected routing | X-Ray trace id(s) |",
+            "|---|---|---|---|",
+        ]
+        for e in report:
+            trace_col = ", ".join(e.get("trace_ids") or []) or "(none found)"
+            index_lines.append(
+                f"| {e['id']} | {e['message']} | {e['expected_routing']} | {trace_col} |"
+            )
+
+    index_lines += ["", f"Per-scenario transcripts: `{out_dir.name}/<scenario-id>.txt`", ""]
+    (out_dir / "INDEX.md").write_text("\n".join(index_lines), encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--offline", action="store_true",
+                             help="Run the real agent graph in-process, no AWS.")
+    mode_group.add_argument("--live", action="store_true",
+                             help="Run against a real deployed AgentCore Runtime.")
+    parser.add_argument("--run-name", default=None,
+                         help="Evidence subdirectory name under evidence/. "
+                              "Defaults to 'live' or 'offline' matching the mode.")
+    parser.add_argument("--out", default=None,
+                         help="Override the full output directory "
+                              "(default: evidence/<run-name>/scenarios).")
+    parser.add_argument("--xray-wait", type=int, default=90,
+                         help="Seconds to poll X-Ray per scenario before giving up "
+                              "(--live only). Traces take 30-60s to appear.")
+    parser.add_argument("--xray-poll-interval", type=int, default=10)
+    args = parser.parse_args(argv)
+
+    mode = "live" if args.live else "offline"
+    run_name = args.run_name or mode
+    out_dir = pathlib.Path(args.out) if args.out else ROOT / "evidence" / run_name / "scenarios"
+
+    print(f"Scenario runner -- {mode} mode")
+    print(f"{len(SCENARIOS)} scenarios, writing evidence to {out_dir}\n")
+
+    if mode == "offline":
+        report = run_offline()
+    else:
+        report = run_live(args.xray_wait, args.xray_poll_interval)
+
+    _write_evidence(mode, report, out_dir)
+
+    failures = sum(1 for e in report if e.get("error"))
+    print(f"\nWrote {out_dir / 'INDEX.md'}")
+    if failures:
+        print(f"{failures} of {len(report)} scenarios errored - see the transcripts.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+RUN_SCENARIOS_PY_EOF
+
 
   ok "config.py"
   ok "requirements.txt"
@@ -5419,6 +5811,7 @@ RUN_ADVERSARIAL_PY_EOF
   ok "infrastructure/seed_data.py"
   ok "infrastructure/cleanup.py"
   ok "scripts/run_adversarial.py"
+  ok "scripts/run_scenarios.py"
   record "Project files" "OK" "$PROJECT_DIR"
 
   # Resolved after materialise, since they are read out of the embedded
@@ -6073,28 +6466,117 @@ run_adversarial_phase() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  9. Package the submission (full form is Task 14)
+#  9. Scenario transcripts (Task 14)
 # ═════════════════════════════════════════════════════════════════════════════
-# This is a minimal package — src/, tests/, infrastructure/, whatever evidence
-# exists, and a redacted .env. Task 14 adds screenshots, adversarial
-# transcripts and an INDEX.md; this gives the flag something real to do
-# until then, rather than a no-op.
+# scripts/run_scenarios.py runs the three Udacity-brief scenarios against the
+# just-deployed runtime and writes one transcript each, plus an X-Ray trace
+# lookup per scenario. It needs a real runtime_arn — if deploy_agent_phase
+# never ran (e.g. a bare --package on an undeployed project), this skips
+# rather than failing the whole run.
+run_scenarios_phase() {
+  phase "Scenario transcripts (scripts/run_scenarios.py)"
+  local script="${PROJECT_DIR}/scripts/run_scenarios.py"
+
+  if [[ ! -f "$script" ]]; then
+    skip "scripts/run_scenarios.py not present — skipping"
+    record "Scenario transcripts" "SKIPPED" "script not found"
+    return 0
+  fi
+  if [[ -z "$(load runtime_arn)" ]] && ! grep -q '^AGENTCORE_RUNTIME_ARN=.' "$ENV_FILE" 2>/dev/null; then
+    skip "no deployed runtime yet — run a full deploy first"
+    record "Scenario transcripts" "SKIPPED" "no runtime_arn"
+    return 0
+  fi
+
+  ( cd "$PROJECT_DIR" && \
+    set -a; [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"; set +a; \
+    "$PY" scripts/run_scenarios.py --live --run-name live ) \
+    2>&1 | tee "${EVIDENCE_DIR}/scenarios_output.txt"
+  local rc=${PIPESTATUS[0]}
+  if [[ $rc -eq 0 ]]; then
+    ok "scenario transcripts written to ${EVIDENCE_DIR}/scenarios"
+    record "Scenario transcripts" "OK" "${EVIDENCE_DIR}/scenarios"
+  else
+    warn "scenario run reported at least one failure (exit $rc)"
+    record "Scenario transcripts" "PARTIAL" "${EVIDENCE_DIR}/scenarios_output.txt"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  10. Package the submission
+# ═════════════════════════════════════════════════════════════════════════════
+# Produces novamart-submission.zip: src/agent_orchestrator.py, .env with every
+# value redacted (key names kept), both required screenshots
+# (01-test-score.png, 02-xray-service-map.png) if present, the adversarial
+# suite, the scenario transcripts, and an INDEX.md that says plainly which
+# parts are live and which are still missing.
+#
+# Screenshots are captured locally by scripts/capture_console.py (it drives a
+# real signed-in Chrome session — CloudShell has no GUI for that), so this
+# phase looks for them at ${EVIDENCE_DIR}/screenshots/*.png. Upload that
+# directory into CloudShell (Actions → Upload file) before running --package
+# if you captured them on a laptop rather than in this same CloudShell home.
 package_submission() {
   phase "Packaging the submission"
 
   local staging="/tmp/novamart-submission" out="${HOME}/novamart-submission.zip"
   rm -rf "$staging" "$out"
-  mkdir -p "$staging/evidence"
+  mkdir -p "$staging/src" "$staging/screenshots" "$staging/adversarial" "$staging/scenarios"
 
-  cp -r "$PROJECT_DIR/src" "$staging/" 2>/dev/null
+  # ── src/agent_orchestrator.py (explicitly required by the rubric) ─────────
+  if [[ -f "$PROJECT_DIR/src/agent_orchestrator.py" ]]; then
+    cp "$PROJECT_DIR/src/agent_orchestrator.py" "$staging/src/"
+    ok "src/agent_orchestrator.py"
+  else
+    warn "src/agent_orchestrator.py not found in $PROJECT_DIR — materialise() may not have run"
+  fi
+  # The rest of src/, tests/ and infrastructure/ too — more context for a
+  # reviewer costs nothing and the rubric's minimum list is a floor, not a
+  # ceiling.
   cp -r "$PROJECT_DIR/tests" "$staging/" 2>/dev/null
   cp -r "$PROJECT_DIR/infrastructure" "$staging/" 2>/dev/null
-  [[ -d "$EVIDENCE_DIR" ]] && cp -r "$EVIDENCE_DIR" "$staging/evidence/live" 2>/dev/null
+  cp -r "$PROJECT_DIR/src" "$staging/src_full" 2>/dev/null
 
+  # ── .env, every value redacted, key names kept ─────────────────────────────
   if [[ -f "$ENV_FILE" ]]; then
-    sed -E 's/=.*/=REDACTED/' "$ENV_FILE" > "$staging/env.redacted.txt"
+    # Only lines that actually assign a key (KEY=value) are touched, so
+    # comments and blank lines in .env stay readable in the submission.
+    sed -E '/^[A-Za-z_][A-Za-z0-9_]*=/ s/=.*/=REDACTED/' "$ENV_FILE" > "$staging/.env"
+    ok ".env (redacted)"
+  else
+    warn "no .env found at $ENV_FILE — nothing to redact"
   fi
 
+  # ── screenshots — captured locally, not by this script ─────────────────────
+  local shots_src="${EVIDENCE_DIR}/screenshots"
+  local shots_found=0
+  if [[ -d "$shots_src" ]]; then
+    cp "$shots_src"/*.png "$staging/screenshots/" 2>/dev/null
+    shots_found=$(find "$staging/screenshots" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [[ -f "$staging/screenshots/01-test-score.png" && -f "$staging/screenshots/02-xray-service-map.png" ]]; then
+    ok "both required screenshots present ($shots_found total)"
+    record "Screenshots" "OK" "$shots_found found, both required present"
+  elif [[ "$shots_found" -gt 0 ]]; then
+    warn "only $shots_found screenshot(s) found — the two REQUIRED shots are"
+    warn "01-test-score.png and 02-xray-service-map.png. Run scripts/capture_console.py"
+    warn "locally and copy its output into ${shots_src}, then re-run --package."
+    record "Screenshots" "PARTIAL" "$shots_found found, required ones missing"
+  else
+    warn "no screenshots found at $shots_src"
+    warn "run scripts/capture_console.py locally, then copy its output here."
+    record "Screenshots" "MISSING" "run scripts/capture_console.py, see cloudshell/README.md"
+  fi
+
+  # ── adversarial suite + scenario transcripts, whichever ran ────────────────
+  [[ -d "${EVIDENCE_DIR}/adversarial" ]] && cp -r "${EVIDENCE_DIR}/adversarial"/. "$staging/adversarial/" 2>/dev/null
+  [[ -d "${EVIDENCE_DIR}/scenarios" ]]   && cp -r "${EVIDENCE_DIR}/scenarios"/.   "$staging/scenarios/"   2>/dev/null
+  local adv_count=$(find "$staging/adversarial" -type f 2>/dev/null | wc -l | tr -d ' ')
+  local scen_count=$(find "$staging/scenarios" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$adv_count"  -gt 0 ]] && ok "adversarial suite ($adv_count files)"  || warn "no adversarial evidence found at ${EVIDENCE_DIR}/adversarial"
+  [[ "$scen_count" -gt 0 ]] && ok "scenario transcripts ($scen_count files)" || warn "no scenario transcripts found at ${EVIDENCE_DIR}/scenarios"
+
+  # ── DEPLOYED_RESOURCES.txt — kept for a quick human-readable summary ──────
   {
     printf 'NovaMart submission — packaged %s by deploy-e2e %s\n\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_VERSION"
@@ -6104,13 +6586,51 @@ package_submission() {
     printf '  Returns KB      %s\n' "$(load kb_returns)"
     printf '  Shipping KB     %s\n' "$(load kb_shipping)"
     printf '  Warranty KB     %s\n' "$(load kb_warranty)"
-    printf '\nFull evidence capture, console screenshots and INDEX.md are added by Task 14.\n'
   } > "$staging/DEPLOYED_RESOURCES.txt"
+
+  # ── INDEX.md — states plainly what is here and what is missing ────────────
+  {
+    printf '# NovaMart submission index\n\n'
+    printf 'Packaged %s by deploy-e2e %s.\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SCRIPT_VERSION"
+    printf '## Contents\n\n'
+    printf '| Item | Status |\n|---|---|\n'
+    if [[ -f "$staging/src/agent_orchestrator.py" ]]; then
+      printf '| src/agent_orchestrator.py | present |\n'
+    else
+      printf '| src/agent_orchestrator.py | MISSING |\n'
+    fi
+    if [[ -f "$staging/.env" ]]; then
+      printf '| .env (redacted) | present — every value replaced with REDACTED, key names kept |\n'
+    else
+      printf '| .env (redacted) | MISSING |\n'
+    fi
+    if [[ -f "$staging/screenshots/01-test-score.png" ]]; then
+      printf '| screenshots/01-test-score.png (required) | present |\n'
+    else
+      printf '| screenshots/01-test-score.png (required) | MISSING |\n'
+    fi
+    if [[ -f "$staging/screenshots/02-xray-service-map.png" ]]; then
+      printf '| screenshots/02-xray-service-map.png (required) | present |\n'
+    else
+      printf '| screenshots/02-xray-service-map.png (required) | MISSING |\n'
+    fi
+    printf '| screenshots/ (supporting, 03-06) | %s file(s) |\n' "$shots_found"
+    printf '| adversarial/ | %s file(s) |\n' "$adv_count"
+    printf '| scenarios/ | %s file(s) |\n' "$scen_count"
+    printf '\n## Honesty note\n\n'
+    printf 'This zip was assembled by an automated script. A "present" row above\n'
+    printf 'means the file existed on disk when packaged — it does not by itself\n'
+    printf 'prove the screenshot shows what its filename claims. Open every\n'
+    printf 'screenshot before submitting. A MISSING row for either required\n'
+    printf 'screenshot means the submission is not yet complete: run\n'
+    printf '`scripts/capture_console.py` locally against the signed-in AWS console\n'
+    printf 'and copy its output into `%s` before re-running --package.\n' "$shots_src"
+  } > "$staging/INDEX.md"
 
   if command -v zip >/dev/null 2>&1; then
     ( cd "$staging" && zip -qr "$out" . )
     ok "$out ($(du -h "$out" 2>/dev/null | cut -f1))"
-    printf '\n   %sDownload it:%s CloudShell → Actions → Download file → paste:\n' "$BOLD" "$RESET"
+    printf '\n   %sDownload it:%s CloudShell → Actions → Download file → paste this exact path:\n' "$BOLD" "$RESET"
     printf '     %s\n\n' "$out"
     record "Package" "OK" "$out"
   else
@@ -6233,6 +6753,8 @@ main() {
     --package)
       banner
       materialise
+      install_dependencies || warn "continuing without a verified venv — run_scenarios_phase may fail to import config"
+      run_scenarios_phase
       package_submission
       summary
       exit 0 ;;
@@ -6248,6 +6770,7 @@ main() {
   deploy_agent_phase
   run_grader
   run_adversarial_phase
+  run_scenarios_phase
   package_submission
   summary
 }

@@ -4,7 +4,7 @@ CloudShell already has the AWS CLI, credentials, Python and `jq`, which is why
 the live path runs there rather than on a laptop.
 
 ```bash
-bash cloudshell/deploy-e2e-v01.sh
+bash cloudshell/deploy-e2e-v02.sh
 ```
 
 Paste the whole file directly into a CloudShell terminal, or upload it with
@@ -14,10 +14,10 @@ the `infrastructure/` scripts) is embedded inside it, so no `git clone` and no
 other download is required beyond calls to AWS itself.
 
 ```bash
-bash cloudshell/deploy-e2e-v01.sh --status     # what exists, change nothing
-bash cloudshell/deploy-e2e-v01.sh --test-only   # re-run the grader only
-bash cloudshell/deploy-e2e-v01.sh --package     # zip src/ + evidence for submission
-bash cloudshell/deploy-e2e-v01.sh --teardown    # delete what the script created
+bash cloudshell/deploy-e2e-v02.sh --status     # what exists, change nothing
+bash cloudshell/deploy-e2e-v02.sh --test-only   # re-run the grader only
+bash cloudshell/deploy-e2e-v02.sh --package     # zip src/ + evidence for submission
+bash cloudshell/deploy-e2e-v02.sh --teardown    # delete what the script created
 ```
 
 ## Honesty note
@@ -85,13 +85,26 @@ Deterministically, without asking, in order:
    output to `evidence/live/pytest_output.txt`. The grader's own exit code
    is always 0 on a completed run, so the summary reads the printed
    `Score: X/Y` line rather than trusting the exit code alone.
-9. **Adversarial suite** — `scripts/run_adversarial.py`, added by a later
-   task in this plan. Until that file exists, this phase prints that it is
-   skipping a not-yet-implemented step rather than failing.
-10. **Package** — a minimal `~/novamart-submission.zip` (source, tests,
-    infrastructure scripts, whatever evidence exists, and a `.env` with every
-    value redacted to `REDACTED`). The richer version — screenshots,
-    adversarial transcripts, `INDEX.md` — is a later task in this plan.
+9. **Adversarial suite** — `scripts/run_adversarial.py --live`: six hostile
+   prompts sent through the deployed runtime, transcripts written to
+   `evidence/live/adversarial/`.
+10. **Scenario transcripts** — `scripts/run_scenarios.py --live`: the three
+    Udacity-brief scenarios (return an order, ask a policy question, do the
+    discount math) sent through the deployed runtime, one transcript each in
+    `evidence/live/scenarios/`, each with an X-Ray trace-id lookup for that
+    call's time window.
+11. **Package** — `~/novamart-submission.zip`: `src/agent_orchestrator.py`
+    (plus the rest of `src/`, `tests/` and `infrastructure/` for context),
+    `.env` with every value redacted to `REDACTED` (key names kept), the
+    adversarial transcripts, the scenario transcripts, whatever screenshots
+    are staged at `evidence/live/screenshots/`, and an `INDEX.md` that says
+    plainly which required screenshots are present and which are missing.
+    Screenshots are **not** produced by this script — CloudShell has no GUI
+    to drive a browser from — so run `scripts/capture_console.py` locally
+    against a signed-in AWS console session and copy its output into
+    `evidence/live/screenshots/` (upload it into this CloudShell session if
+    you captured it elsewhere) before running `--package`, or re-run
+    `--package` afterward to pick them up.
 
 `--package` and `--test-only` both print the same honesty/cost banner and
 end-of-run summary table as a full run — the banner and summary appear on
@@ -108,9 +121,12 @@ already filled in, and the run continues rather than aborting.
 
 ## What it does not do
 
-- **The adversarial guardrail suite and the full evidence package** stay
-  pending until Tasks 13 and 14 of this plan land; this script's `--package`
-  produces a minimal zip in the meantime.
+- **Console screenshots.** `scripts/capture_console.py` drives a real,
+  signed-in Chrome session and CloudShell has no GUI for that, so it is run
+  locally, not by this script. `--package` looks for its output at
+  `evidence/live/screenshots/` and says plainly in `INDEX.md` if the two
+  required shots (`01-test-score.png`, `02-xray-service-map.png`) are
+  missing, rather than packaging a submission that silently lacks them.
 
 ## Cost
 
@@ -124,7 +140,7 @@ The last row is the one that empties a student budget. Screenshot what you
 need, then:
 
 ```bash
-bash cloudshell/deploy-e2e-v01.sh --teardown
+bash cloudshell/deploy-e2e-v02.sh --teardown
 ```
 
 `--teardown` (and the equivalent `cloudshell/cleanup-all.sh`, for a full git
@@ -138,7 +154,7 @@ project copy at `~/novamart-project`.
 ## Reading it before running it
 
 [`_deploy-e2e.template.sh`](_deploy-e2e.template.sh) is the source; the
-generated `deploy-e2e-v01.sh` is what you actually paste, produced by
+generated `deploy-e2e-v02.sh` is what you actually paste, produced by
 `python scripts/build_cloudshell_script.py`. The embedded files are quoted
 heredocs (`<<'SENTINEL'`), not base64 — the whole thing is meant to stay
 readable enough to check mid-run if something looks wrong. Every
